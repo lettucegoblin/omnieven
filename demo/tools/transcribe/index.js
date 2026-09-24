@@ -41,8 +41,9 @@ const CUE_EVERY_MS = 12_000, CUE_MIN_WORDS = 12, CUE_TTL_MS = 45_000
 // a bordered box needs room for the border too, or the firmware shows a scrollbar
 const BADGE_W = 366, CLOCK_W = 200, BOX_LINE = LINE + 2 * PAD + 4, EXPANDED_H = 4 * LINE + 2 * PAD + 4, LIST_H = 7 * LINE
 const BOX = { width: 1, color: 15, radius: 8 }
-/** Only glyphs the firmware font actually has. */
-const ICON = { definition: '◆', recall: '★', prep: '●', answer: '◇', person: '■', todo: '□', reminder: '▲' }
+// The firmware font has no emoji (💡 and friends render as nothing), so the
+// "idea" mark is the closest glyph it does have — a glowing ring.
+const BULB = '◎'
 const CAPTION_KEEP = 600   // chars of finished text kept on screen (Deepgram gives us the rest)
 
 /** @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx */
@@ -525,15 +526,15 @@ export default {
 
       if (m.screen === 'insights') {
         const rows = m.insights.length
-          ? m.insights.slice(-20).reverse().map((c) => ctx.ui.fit(`${ICON[c.type] || '●'} ${c.header}`, 540))
+          ? m.insights.slice(-20).reverse().map((c) => ctx.ui.fit(`${BULB} ${c.header}`, 540))
           : ['(no insights yet)']
         top.push({ type: 'list', name: 'insights', x: 0, y: 0, w: W, h: LIST_H, capture: true, items: rows })
       } else if (m.screen === 'insight') {
         const c = m.insights[m.insightAt] || m.cue
-        const body = c ? `${ICON[c.type] || '●'} ${c.header}\n${c.text}${c.todo ? '\nswipe up: add to Todoist' : ''}` : '(gone)'
+        const body = c ? `${BULB} ${c.header}\n${c.text}${c.todo ? '\nswipe up: add to Todoist' : ''}` : '(gone)'
         top.push({ type: 'text', name: 'insight', x: 0, y: 0, w: W, h: EXPANDED_H, padding: PAD, border: BOX, text: ctx.ui.wrap(body, W - 2 * PAD - 10).slice(0, 4).join('\n') })
       } else {
-        if (m.cue) top.push({ type: 'text', name: 'badge', x: 0, y: 0, w: BADGE_W, h: BOX_LINE, padding: PAD, border: BOX, text: ctx.ui.fit(`${ICON[m.cue.type] || '●'} ${m.cue.header}`, BADGE_W - 2 * PAD - 10) })
+        if (m.cue) top.push({ type: 'text', name: 'badge', x: 0, y: 0, w: BADGE_W, h: BOX_LINE, padding: PAD, border: BOX, text: ctx.ui.fit(`${BULB} ${m.cue.header}`, BADGE_W - 2 * PAD - 10) })
         else if (m.insights.length) top.push({ type: 'text', name: 'badge', x: 0, y: 0, w: 150, h: BOX_LINE, padding: PAD, textColor: 2, text: `${m.insights.length} insight${m.insights.length > 1 ? 's' : ''}` })
         const bars = '▌'.repeat(Math.max(1, Math.min(3, 1 + Math.round(m.level * 2))))
         const time = new Date().toLocaleTimeString(ctx.locale, { hour: 'numeric', minute: '2-digit', timeZone: ctx.tz })
