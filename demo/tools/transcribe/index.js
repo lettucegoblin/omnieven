@@ -4,10 +4,11 @@
 // that go straight to Todoist).
 //
 //   idle    tap: start · menu: Sessions, Clear prep notes
-//   live    captions scroll; a cue appears in the dim box at the bottom
-//           double-tap: end (asks first) · swipe up: accept the suggested to-do
-//           (adds to Todoist) · swipe down: dismiss cue
-//   confirm end the transcription? keep recording / save / discard
+//   live    three lines of captions; the newest insight sits in a badge top left
+//           tap: open it (tap again to close) · double-tap: stop? (asks, No first)
+//           swipe up: accept the suggested to-do · swipe down: dismiss the badge
+//   insights the session's insights, newest first; the first row goes back
+//   confirm  a small "stop recording?" box — No is selected, so a stray tap keeps going
 //   The audio is kept alongside the transcript (mp3 when an encoder is installed,
 //   otherwise WAV) so a doubtful line can be listened back to on the phone page.
 //   review  tap: next page · menu: Add all to-dos to Todoist, Add to-do N…, Back
@@ -525,9 +526,8 @@ export default {
       const top = []
 
       if (m.screen === 'insights') {
-        const rows = m.insights.length
-          ? m.insights.slice(-20).reverse().map((c) => ctx.ui.fit(`${BULB} ${c.header}`, 540))
-          : ['(no insights yet)']
+        const rows = ['‹ back to the captions',
+          ...(m.insights.length ? m.insights.slice(-20).reverse().map((c) => ctx.ui.fit(`${BULB} ${c.header}`, 540)) : ['(nothing yet)'])]
         top.push({ type: 'list', name: 'insights', x: 0, y: 0, w: W, h: LIST_H, capture: true, items: rows })
       } else if (m.screen === 'insight') {
         const c = m.insights[m.insightAt] || m.cue
@@ -555,12 +555,17 @@ export default {
     }
 
     if (m.screen === 'confirm') {
+      // A small box in the middle rather than a full screen, with "No" first so
+      // the highlighted row is the safe one.
       const secs = (Date.now() - m.startedAt) / 1000
+      const bx = 96, bw = W - 2 * bx
       return {
-        containers: [header(`End the transcription?  ·  ${clock(secs)}  ·  ${words(transcript(m))} words  ·  still recording`),
-          { type: /** @type {const} */ ('list'), name: 'confirm', x: 0, y: HEADER, w: W, h: H - HEADER, capture: true,
-            items: ['Keep recording', 'End & summarize', 'End & discard (delete the recording)'] }],
-        menu: [{ id: 'resume', label: 'Keep recording' }, { id: 'stop', label: 'End & summarize' }, { id: 'discard', label: 'End & discard' }],
+        containers: [
+          { type: /** @type {const} */ ('text'), name: 'ask', x: bx, y: 40, w: bw, h: BOX_LINE, padding: PAD, border: BOX, textColor: 4,
+            text: ctx.ui.align(`Stop recording?  ${clock(secs)}`, bw - 2 * PAD - 10, 'center') },
+          { type: /** @type {const} */ ('list'), name: 'confirm', x: bx, y: 40 + BOX_LINE + 6, w: bw, h: 150, capture: true,
+            items: ['No — keep recording', 'Yes — stop & summarize', 'Stop & discard'] }],
+        menu: [{ id: 'resume', label: 'No — keep recording' }, { id: 'stop', label: 'Yes — stop & summarize' }, { id: 'discard', label: 'Stop & discard' }],
       }
     }
 
@@ -626,33 +631,34 @@ export default {
         if (ev.type === 'tap') { void start(ctx); return true }
         return
       case 'live':
-        // tap opens the insight on the badge, double-tap the list of them all
+        // tap opens the badge (or the list); double-tap always asks to stop
         if (ev.type === 'tap') {
           if (m.cue) { m.insightAt = Math.max(0, m.insights.lastIndexOf(m.cue)); m.screen = 'insight'; ctx.render() }
           else if (m.insights.length) { m.screen = 'insights'; ctx.render() }
-          else hint(ctx, 'menu: end · insights appear here')
+          else hint(ctx, 'double-tap to stop · insights appear here')
           return true
         }
-        if (ev.type === 'double') { m.screen = 'insights'; ctx.render(); return true }
+        if (ev.type === 'double') { m.screen = 'confirm'; ctx.render(); return true }
         if (ev.type === 'up') { if (m.cue?.todo) { const t = m.cue.todo; m.cue = null; void addTodo(ctx, t); ctx.render() } return true }
         if (ev.type === 'down') { m.cue = null; ctx.render(); return true }
         return
       case 'insight': {
         const c = m.insights[m.insightAt]
         if (ev.type === 'tap') { m.screen = 'live'; ctx.render(); return true }
-        if (ev.type === 'double') { m.screen = 'insights'; ctx.render(); return true }
+        if (ev.type === 'double') { m.screen = 'confirm'; ctx.render(); return true }
         if (ev.type === 'up') { if (c?.todo) { void addTodo(ctx, c.todo); if (m.cue === c) m.cue = null; m.screen = 'live'; ctx.render() } return true }
         if (ev.type === 'down') { if (m.cue === c) m.cue = null; m.screen = 'live'; ctx.render(); return true }
         return
       }
       case 'insights':
         if (ev.type === 'select') {
-          const shown = m.insights.slice(-20).reverse()
-          const c = shown[ev.index]
+          if (ev.index === 0) { m.screen = 'live'; ctx.render(); return true }   // "‹ back to the captions"
+          const c = m.insights.slice(-20).reverse()[ev.index - 1]
           if (c) { m.insightAt = m.insights.lastIndexOf(c); m.screen = 'insight'; ctx.render() }
+          else { m.screen = 'live'; ctx.render() }
           return true
         }
-        if (ev.type === 'double' || ev.type === 'tap') { m.screen = 'live'; ctx.render(); return true }
+        if (ev.type === 'double') { m.screen = 'confirm'; ctx.render(); return true }
         return
       case 'confirm':
         if (ev.type === 'select') {
