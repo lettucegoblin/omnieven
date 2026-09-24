@@ -73,6 +73,10 @@ export async function handleApi(req: IncomingMessage, res: ServerResponse, url: 
         apps: shell.appSummaries(), lastEvent: shell.lastEvent,
       }); return true
     }
+    if (path === '/cache') {
+      if (m === 'POST') { const b = await readJson(req); const id = String(b.app || ''); sendJson(res, 200, id ? { pushed: await shell.pushCache(id) } : { pushed: await shell.pushAllCaches().then(() => 'all') }); return true }
+      sendJson(res, 200, { cached: [...shell.cached].map(([key, pages]) => ({ key, pages })) }); return true
+    }
     if (m === 'GET' && path === '/apps') { sendJson(res, 200, { apps: shell.appSummaries() }); return true }
     if (m === 'GET' && path === '/screen') {
       const c = compile(shell.currentView())

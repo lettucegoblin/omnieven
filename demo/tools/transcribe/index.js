@@ -104,6 +104,9 @@ const stamp = (/** @type {number} */ ms) => `${Math.floor(ms / 60000)}:${String(
 function keytermsFor(ctx) {
   /** @type {string[]} */ const out = []
   const prep = (ctx.state.prep || '').toLowerCase()
+  // words the user has corrected by hand come first: they are the ones the
+  // model keeps getting wrong (see the Knowledge app's corrections list)
+  for (const c of knownCorrections(ctx)) if (!out.some((x) => x.toLowerCase() === c.to.toLowerCase())) out.push(c.to)
   try {
     indexNotes(ctx)
     const notes = store(ctx).listNotes().filter((n) => /^(people|tools|terms)\//.test(n.path))
@@ -116,6 +119,11 @@ function keytermsFor(ctx) {
     if (!out.some((x) => x.toLowerCase() === w.toLowerCase())) out.unshift(w)
   }
   return out.slice(0, 45)
+}
+
+/** Hand-made corrections ("heard Bicon, it is Ficon"). @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx */
+function knownCorrections(ctx) {
+  try { return /** @type {{ from: string, to: string }[]} */ (JSON.parse(readFileSync(join(ctx.dataDir, 'corrections.json'), 'utf8'))) } catch { return [] }
 }
 
 // ── the recording ────────────────────────────────────────────────────
@@ -453,6 +461,15 @@ function couldBeMisheard(a, b) {
 async function glossaryFix(ctx, text) {
   const glossary = keytermsFor(ctx)
   if (!glossary.length || !text.trim()) return { text, changes: 0 }
+  // the user's own corrections are applied outright, no model involved
+  let fixed = text, applied = 0
+  for (const c of knownCorrections(ctx)) {
+    const re = new RegExp(`\\b${c.from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi')
+    const before = fixed
+    fixed = fixed.replace(re, c.to)
+    if (fixed !== before) applied++
+  }
+  text = fixed
   try {
     const raw = await ask(ctx, {
       model: 'fast', maxTokens: 800, timeoutMs: 30_000,
@@ -472,8 +489,8 @@ async function glossaryFix(ctx, text) {
       out = out.replace(re, to)
       if (out !== before) changes++
     }
-    return { text: out, changes }
-  } catch (err) { ctx.log(`glossary: ${err instanceof Error ? err.message : err}`); return { text, changes: 0 } }
+    return { text: out, changes: changes + applied }
+  } catch (err) { ctx.log(`glossary: ${err instanceof Error ? err.message : err}`); return { text, changes: applied } }
 }
 
 // ── app ──────────────────────────────────────────────────────────────
@@ -736,6 +753,15 @@ export default {
   },
 
   onMessage(ctx, msg) {
+    // Action items other apps can work through (Todoist shows them in its inbox).
+    if (msg?.pending) return { actions: store(ctx).openActions(30) }
+    if (msg?.markAction?.text) {
+      const s = store(ctx)
+      if (msg.markAction.session) s.markAction(Number(msg.markAction.session), String(msg.markAction.text))
+      else for (const a of s.openActions(50)) if (a.text === msg.markAction.text) s.markAction(a.session, a.text)
+      return { ok: true, left: store(ctx).openActions(30).length }
+    }
+    if (msg?.clearPending) { const s = store(ctx); for (const a of s.openActions(50)) s.markAction(a.session, a.text); return { ok: true, left: 0 } }
     // {"insight":{"type":"recall","header":"SAP feed outage","text":"…"}} — used by
     // the demo/test harness and by other apps that want to raise something.
     if (msg?.insight?.header) {

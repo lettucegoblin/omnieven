@@ -46,6 +46,14 @@ export interface CmdArgs {
   'storage.set': { key: string; value: string }
   /** shutDownPageContainer; 1 = system exit dialog, 0 = immediate */
   shutdown: { mode: 0 | 1 }
+  /**
+   * Store a pack of pre-rendered pages on the phone so the app still works
+   * when the server is unreachable. The client treats it as opaque: it only
+   * shows the pages and remembers where the wearer got to.
+   */
+  'cache.put': { key: string; title: string; pages: PagePayload[]; index?: number }
+  /** drop one pack (or all of them) */
+  'cache.clear': { key?: string }
   /** reload the WebView page */
   reload: Record<string, never>
 }
@@ -89,6 +97,8 @@ export type ClientFrame =
    * so the phone companion uses this instead. `path` is relative to `/api`.
    */
   | { t: 'api'; id: number; method: string; path: string; body?: string }
+  /** how far the wearer got in a cached pack while the server was unreachable */
+  | { t: 'cache'; key: string; index: number }
 
 // ── Even Hub event envelope (as relayed from onEvenHubEvent) ───────
 // Protobuf omits zero-valued fields, so eventType 0 (CLICK) and index 0

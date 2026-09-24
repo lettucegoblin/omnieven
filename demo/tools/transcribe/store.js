@@ -158,7 +158,17 @@ export class Store {
     return readFileSync(f, 'utf8')
   }
 
-  /** Open action items across all sessions (for reminders). */
+  /** Tick an action item off (it went to the task manager, or was dismissed).
+   * @param {number} id @param {string} text @param {boolean} [done] */
+  markAction(id, text, done = true) {
+    const s = this.get(id)
+    if (!s) return false
+    let hit = false
+    const actions = s.actions.map((a) => (a.text === text ? (hit = true, { ...a, done }) : a))
+    if (hit) { this.update(id, { actions }); this.finish(id) }
+    return hit
+  }
+  /** @param {number} [limit] */
   openActions(limit = 20) {
     /** @type {{ session: number, title: string, text: string, due?: string }[]} */ const out = []
     for (const s of this.list(50)) for (const a of s.actions) if (!a.done) out.push({ session: s.id, title: s.title, text: a.text, due: a.due })

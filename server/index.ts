@@ -141,6 +141,7 @@ wss.on('connection', (ws, req) => {
       case 'log': log(`client:${conn.id}`, `${frame.level}: ${frame.msg}`); break
       case 'pong': conn.alivePing = true; break
       case 'api': void tunnelApi(conn, frame); break
+      case 'cache': shell.handleCachedProgress(frame.key, Number(frame.index) || 0); break
       default: log('warn', `client ${conn.id} unknown frame ${(frame as { t: string }).t}`)
     }
   })

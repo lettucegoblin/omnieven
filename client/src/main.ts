@@ -16,6 +16,7 @@ import {
 import { OmniSocket } from './ws'
 import { Companion, type ApiTransport } from './companion'
 import { initSetup } from './setup'
+import { OfflineShell, clearPacks, listPacks, storePack } from './offline'
 import { CLIENT_VERSION, type ClientFrame, type Cmd, type PagePayload, type ServerFrame } from './protocol'
 
 // Stored through the Even App storage bridge as two plain strings (older
@@ -97,12 +98,15 @@ const sock = new OmniSocket({
     setStatus('Connected', 'ok')
     splash('Connected to your server — loading the dashboard…')
     log('socket open')
+    // Hand the display back and tell the server how far we read on our own.
+    for (const p of offline.leave()) sendFrame({ t: 'cache', key: p.key, index: p.index })
     void sendHello()
     companion.start()
   },
   onClose: (reason) => {
     setStatus(`Disconnected (${reason || 'closed'}) – retrying`, 'wait')
-    splash(`Omni started.\n\nCan't reach the server (${reason || 'closed'}) — retrying.\nCheck the URL and token in Omni on your phone.`)
+    if (offline.hasPacks) goOffline(`server unreachable (${reason || 'closed'})`)
+    else splash(`Omni started.\n\nCan't reach the server (${reason || 'closed'}) — retrying.\nCheck the URL and token in Omni on your phone.`)
   },
   onJson: (frame: ServerFrame) => {
     if (frame.t === 'ping') { sendFrame({ t: 'pong' }); return }
@@ -151,6 +155,25 @@ async function sendHello() {
   })
 }
 
+/** Route a glasses event to the offline shell; true when it was handled there. */
+function handleOffline(ev: EvenHubEvent): boolean {
+  const sys = ev.sysEvent, text = ev.textEvent, list = ev.listEvent
+  let kind: 'tap' | 'double' | 'up' | 'down' | 'select' | null = null
+  let index = 0
+  if (list && (list.eventType ?? OsEventTypeList.CLICK_EVENT) === OsEventTypeList.CLICK_EVENT) { kind = 'select'; index = Number(list.currentSelectItemIndex ?? 0) }
+  else if (text) { const t = text.eventType ?? OsEventTypeList.CLICK_EVENT; kind = t === OsEventTypeList.SCROLL_TOP_EVENT ? 'up' : t === OsEventTypeList.SCROLL_BOTTOM_EVENT ? 'down' : 'tap' }
+  else if (sys) {
+    const t = sys.eventType ?? OsEventTypeList.CLICK_EVENT
+    if (t === OsEventTypeList.SYSTEM_EXIT_EVENT || t === OsEventTypeList.ABNORMAL_EXIT_EVENT) { pageCreated = false; serverPageShown = false; offline.leave(); return false }
+    kind = t === OsEventTypeList.DOUBLE_CLICK_EVENT ? 'double' : t === OsEventTypeList.SCROLL_TOP_EVENT ? 'up' : t === OsEventTypeList.SCROLL_BOTTOM_EVENT ? 'down' : t === OsEventTypeList.CLICK_EVENT ? 'tap' : null
+  }
+  if (!kind) return false
+  void offline.event(kind, index).then((r) => {
+    if (r === 'exit') void exclusive(() => withTimeout(bridge!.shutDownPageContainer(1), 'shutDownPageContainer')).catch(() => {})
+  })
+  return true
+}
+
 function b64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64)
   const out = new Uint8Array(bin.length)
@@ -193,6 +216,29 @@ function splash(status: string) {
     } catch (err) { log(`splash: ${err}`, 'warn') }
   }).catch(() => {})
 }
+/**
+ * Put a page on the glasses (create it the first time, rebuild after that).
+ * Used by the server's `page` command and by the offline shell.
+ */
+async function drawPage(page: PagePayload): Promise<void> {
+  if (!bridge) return
+  if (!pageCreated) {
+    const r = await withTimeout(bridge.createStartUpPageContainer(page as any), 'createStartUpPageContainer')
+    pageCreated = r === 0
+    if (r !== 0) throw new Error(`create result ${r}`)
+  } else {
+    const ok = await withTimeout(bridge.rebuildPageContainer(page as any), 'rebuildPageContainer')
+    if (!ok) throw new Error('rebuild returned false')
+  }
+}
+/** Pages kept for when the server can't be reached; it knows nothing about the apps. */
+const offline = new OfflineShell((page) => exclusive(() => drawPage(page)), (msg) => log(msg))
+/** Run the offline shell (if anything is stored) and report where we got to later. */
+function goOffline(reason: string) {
+  if (offline.active || serverPageShown && sock.connected) return
+  void offline.enter(reason).then((shown) => { if (shown) setStatus(`Offline — showing ${listPacks().length} saved pack(s)`, 'wait') })
+}
+
 const SPLASH_NO_SERVER = 'Omni started.\n\nNo server set up yet — open Omni on your phone\nfor the setup guide (manual, or hand it to an AI assistant).'
 
 async function runCmd(cmd: Cmd) {
@@ -202,16 +248,10 @@ async function runCmd(cmd: Cmd) {
   try {
     switch (cmd.op) {
       case 'page': {
-        const args = cmd.args as any
         serverPageShown = true
-        if (!pageCreated) {
-          const r = await withTimeout(bridge.createStartUpPageContainer(args), 'createStartUpPageContainer')
-          pageCreated = r === 0
-          reply(r === 0, r, r === 0 ? undefined : `create result ${r}`)
-        } else {
-          const ok = await withTimeout(bridge.rebuildPageContainer(args), 'rebuildPageContainer')
-          reply(!!ok, ok, ok ? undefined : 'rebuild returned false')
-        }
+        if (offline.active) offline.leave()   // the server is drawing again
+        try { await drawPage(cmd.args as PagePayload); reply(true, true) }
+        catch (err) { reply(false, undefined, (err as Error).message) }
         return
       }
       case 'text': {
@@ -273,6 +313,18 @@ async function runCmd(cmd: Cmd) {
         reply(!!ok, ok)
         return
       }
+      case 'cache.put': {
+        const r = storePack(cmd.args)
+        log(`cache: ${cmd.args.key} ${cmd.args.pages?.length ?? 0} page(s)${r.ok ? '' : ` not stored (${r.reason})`}`)
+        reply(r.ok, r.ok || r.reason)
+        return
+      }
+      case 'cache.clear': {
+        const n = clearPacks(cmd.args?.key)
+        log(`cache: cleared ${n} pack(s)`)
+        reply(true, n)
+        return
+      }
       case 'reload': {
         reply(true)
         setTimeout(() => window.location.reload(), 200)
@@ -293,6 +345,7 @@ async function runCmd(cmd: Cmd) {
 
 // ── event relay ──────────────────────────────────────────────────────
 function relayEvent(ev: EvenHubEvent) {
+  if (offline.active && handleOffline(ev)) return
   if (ev.audioEvent) {
     // PCM 16 kHz s16le mono. Binary frame; the server knows the format.
     const pcm = (ev.audioEvent as any).audioPcm as Uint8Array | undefined
@@ -422,8 +475,11 @@ async function boot() {
   }
   elDisconnect.onclick = () => { sock.disconnect(); companion.stop(); setStatus('Disconnected', 'bad') }
 
-  if (profile.url && profile.token) connectWith(profile)
-  else { setStatus('No server set up yet', 'wait'); splash(SPLASH_NO_SERVER); companion.showTab('setup') }
+  if (profile.url && profile.token) {
+    connectWith(profile)
+    // If the server is unreachable the socket's onClose brings the packs up.
+    setTimeout(() => { if (!sock.connected && !serverPageShown) goOffline('no connection at start-up') }, 6000)
+  } else { setStatus('No server set up yet', 'wait'); splash(SPLASH_NO_SERVER); companion.showTab('setup') }
 }
 
 void boot()

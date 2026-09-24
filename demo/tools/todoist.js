@@ -10,7 +10,8 @@
 /** @typedef {{ id: string, content: string, priority: number, project_id: string, due: { date: string, string?: string } | null, checked?: boolean, is_completed?: boolean }} Task */
 /** @typedef {{ id: string, name: string, is_inbox_project?: boolean }} Project */
 /** @typedef {{ view: 'today'|'project'|'all' }} State */
-/** @typedef {{ tasks: Task[], projects: Project[], project: Project | null, open: Task | null, error: string, loading: boolean, fetched: number, lastAdded: string }} Mem */
+/** @typedef {{ session: number, text: string, due?: string }} Suggestion */
+/** @typedef {{ tasks: Task[], projects: Project[], project: Project | null, open: Task | null, error: string, loading: boolean, fetched: number, lastAdded: string, suggestions: Suggestion[] }} Mem */
 
 const API = 'https://api.todoist.com/api/v1'
 const W = 576, HEADER = 36
@@ -53,6 +54,17 @@ async function loadProjects(ctx) {
   m.project = (want && m.projects.find((p) => p.name.toLowerCase() === want)) || m.projects.find((p) => p.is_inbox_project || /** @type {any} */ (p).inbox_project) || m.projects[0] || null
 }
 
+/**
+ * Action items the Transcribe app noted in conversations and that have not been
+ * filed anywhere yet — they sit at the top of the list, one tap to add.
+ * @param {import('../../shared/app.ts').AppContext<State, Mem>} ctx
+ */
+function loadSuggestions(ctx) {
+  try {
+    const r = /** @type {any} */ (ctx.message('transcribe', { pending: true }))
+    ctx.mem.suggestions = Array.isArray(r?.actions) ? r.actions.map((/** @type {any} */ a) => ({ session: a.session, text: String(a.text), due: a.due })) : []
+  } catch { ctx.mem.suggestions = [] }   // no Transcribe app installed
+}
 /** @param {import('../../shared/app.ts').AppContext<State, Mem>} ctx */
 async function refresh(ctx) {
   const m = ctx.mem
@@ -66,6 +78,7 @@ async function refresh(ctx) {
     if (ctx.state.view === 'today') { const today = isoToday(ctx); tasks = tasks.filter((t) => t.due && t.due.date.slice(0, 10) <= today) }
     tasks.sort((a, b) => (a.due?.date || '9999').localeCompare(b.due?.date || '9999') || b.priority - a.priority)
     m.tasks = tasks
+    loadSuggestions(ctx)
     m.fetched = Date.now()
   } catch (err) { m.error = err instanceof Error ? err.message : String(err) }
   m.loading = false
@@ -132,7 +145,7 @@ export default {
   init(ctx) {
     ctx.state.view ??= 'project'
     ctx.mem.tasks ??= []; ctx.mem.projects ??= []; ctx.mem.project ??= null
-    ctx.mem.open = null; ctx.mem.error = ''; ctx.mem.loading = false; ctx.mem.fetched ??= 0; ctx.mem.lastAdded = ''
+    ctx.mem.open = null; ctx.mem.error = ''; ctx.mem.loading = false; ctx.mem.fetched ??= 0; ctx.mem.lastAdded = ''; ctx.mem.suggestions ??= []
   },
   onOpen(ctx) { if (Date.now() - ctx.mem.fetched > 30_000) void refresh(ctx) },
   onSettingsChange(ctx) { void refresh(ctx) },
@@ -151,13 +164,19 @@ export default {
         menu: [{ id: 'done', label: 'Complete' }, { id: 'tomorrow', label: 'Postpone to tomorrow' }, { id: 'nextweek', label: 'Postpone a week' }, { id: 'back', label: 'Back to list' }],
       }
     }
-    const items = m.tasks.slice(0, 20).map((t) => {
-      const due = dueLabel(ctx, t)
-      const mark = due === 'overdue' ? '! ' : t.priority === 4 ? '* ' : ''
-      return ctx.ui.fit(`${mark}${t.content}${due ? `  · ${due}` : ''}`, 540)
-    })
+    // From the conversations first ("+ …" adds it), then the real tasks.
+    const sugg = m.suggestions.slice(0, 8)
+    const items = [
+      ...sugg.map((x) => ctx.ui.fit(`+ ${x.text}${x.due ? `  · ${x.due}` : ''}`, 540)),
+      ...m.tasks.slice(0, 20 - sugg.length - (sugg.length ? 1 : 0)).map((t) => {
+        const due = dueLabel(ctx, t)
+        const mark = due === 'overdue' ? '! ' : t.priority === 4 ? '* ' : ''
+        return ctx.ui.fit(`${mark}${t.content}${due ? `  · ${due}` : ''}`, 540)
+      }),
+      ...(sugg.length ? ['— clear the suggestions'] : []),
+    ]
     return {
-      containers: [header(`Todoist  ·  ${viewName}  ·  ${m.loading ? 'refreshing…' : `${m.tasks.length} open`}`),
+      containers: [header(`Todoist  ·  ${viewName}  ·  ${m.loading ? 'refreshing…' : `${sugg.length ? `${sugg.length} from talks  ·  ` : ''}${m.tasks.length} open`}`),
         items.length
           ? { type: 'list', name: 'tasks', x: 0, y: HEADER, w: W, h: 288 - HEADER, capture: true, items }
           : { type: 'text', name: 'empty', x: 0, y: HEADER, w: W, h: 288 - HEADER, padding: 4, capture: true, textColor: 2, text: m.loading ? 'loading…' : 'Nothing open here.\n\nmenu: switch view · refresh' }],
@@ -173,7 +192,23 @@ export default {
       if (ev.type === 'tap') { void complete(ctx, m.open).catch((e) => { m.error = e.message; ctx.render() }); return true }
       return
     }
-    if (ev.type === 'select') { const t = m.tasks[ev.index]; if (t) { m.open = t; ctx.render() } return true }
+    if (ev.type === 'select') {
+      const sugg = m.suggestions.slice(0, 8)
+      const shown = m.tasks.slice(0, 20 - sugg.length - (sugg.length ? 1 : 0))
+      if (ev.index < sugg.length) {   // "+ …": add it and tick it off in Transcribe
+        const x = sugg[ev.index]
+        void addTask(ctx, { text: x.text, due: x.due }).then(() => { try { ctx.message('transcribe', { markAction: { session: x.session, text: x.text } }) } catch {} loadSuggestions(ctx); ctx.render() })
+        return true
+      }
+      if (ev.index === sugg.length + shown.length && sugg.length) {   // "— clear the suggestions"
+        try { ctx.message('transcribe', { clearPending: true }) } catch {}
+        loadSuggestions(ctx); ctx.notify('Suggestions cleared', { ms: 1200 }); ctx.render()
+        return true
+      }
+      const t = shown[ev.index - sugg.length]
+      if (t) { m.open = t; ctx.render() }
+      return true
+    }
   },
   onMenu(ctx, id) {
     const m = ctx.mem
@@ -200,8 +235,12 @@ export default {
       const text = req.query.text || b.text
       if (!text) return { status: 400, json: { error: 'text required' } }
       const task = await addTask(ctx, { text: String(text), due: req.query.due || b.due, priority: req.query.priority || b.priority, project: req.query.project || b.project })
+      const session = Number(req.query.session || b.session || 0)
+      if (session) { try { ctx.message('transcribe', { markAction: { session, text: String(text) } }) } catch {} ; loadSuggestions(ctx) }
       return { ok: true, id: task.id, content: task.content }
     }
+    if (req.path === '/clear-suggestions' && req.method === 'POST') { try { ctx.message('transcribe', { clearPending: true }) } catch {} ; loadSuggestions(ctx); ctx.render(); return { ok: true } }
+    if (req.path === '/suggestions') { loadSuggestions(ctx); return { suggestions: ctx.mem.suggestions } }
     if (req.path === '/list') {
       if (Date.now() - ctx.mem.fetched > 30_000) await refresh(ctx)
       return { view: ctx.state.view, project: ctx.mem.project?.name ?? null, tasks: ctx.mem.tasks.map((t) => ({ id: t.id, content: t.content, due: t.due?.date ?? null, priority: t.priority })) }
@@ -220,13 +259,17 @@ export default {
     if (!ctx.env.TODOIST_TOKEN) return '<h1>Todoist</h1><p class="muted">Set <code>TODOIST_TOKEN</code> in the server\'s .env (Todoist → Settings → Integrations → Developer).</p>'
     if (Date.now() - m.fetched > 30_000) await refresh(ctx)
     const esc = (/** @type {string} */ t) => t.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c] || c)
+    const sugg = m.suggestions.map((x) => `<li><span>${esc(x.text)}${x.due ? ` <small class="muted">· ${esc(x.due)}</small>` : ''}</span><button data-add="${esc(x.text)}" data-session="${x.session}" data-due="${esc(x.due || '')}">+ add</button></li>`).join('')
     const rows = m.tasks.map((t) => `<li><span>${esc(t.content)}${t.due ? ` <small class="muted">· ${esc(dueLabel(ctx, t))}</small>` : ''}</span><button data-done="${t.id}">Done</button></li>`).join('')
     return `<h1>Todoist <small class="muted">${esc(m.project?.name ?? '')} · ${ctx.state.view}</small></h1>
       ${m.error ? `<p class="bad">${esc(m.error)}</p>` : ''}
+      ${sugg ? `<div class="card"><b>From your conversations</b> <small class="muted">${m.suggestions.length}</small><ul class="rows">${sugg}</ul><div class="row"><button id="clear-sugg" class="secondary">Clear all</button></div></div>` : ''}
       <form id="add"><input name="text" placeholder="Add a task…" required /><input name="due" placeholder="due (tomorrow, fri 3pm)…" style="max-width:40%" /><button>Add</button></form>
       <ul class="rows">${rows || '<li class="muted">nothing open</li>'}</ul>
       <script>
         document.getElementById('add').onsubmit = (e) => { e.preventDefault(); const f = e.target; omni.api('/add', { method: 'POST', body: { text: f.text.value, due: f.due.value || undefined } }).then(() => omni.reload()) }
+        for (const b of document.querySelectorAll('[data-add]')) b.onclick = () => { b.textContent = 'adding…'; omni.api('/add', { method: 'POST', body: { text: b.dataset.add, due: b.dataset.due || undefined, session: b.dataset.session } }).then(() => omni.reload()) }
+        const cs = document.getElementById('clear-sugg'); if (cs) cs.onclick = () => omni.api('/clear-suggestions', { method: 'POST' }).then(() => omni.reload())
         for (const b of document.querySelectorAll('[data-done]')) b.onclick = () => omni.api('/complete?id=' + b.dataset.done, { method: 'POST' }).then(() => omni.reload())
       </script>`
   },

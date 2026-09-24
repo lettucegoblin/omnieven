@@ -20,6 +20,7 @@ export const SETTINGS_ID = 'settings'
 
 const MENU = { HOME: 1, EXIT: 2, SETTINGS: 3, APP_SETTINGS: 4, APP_BASE: 10, CUSTOM_BASE: 100, MAX_ITEMS: 10, MAX_CUSTOM: 8 }
 const RENDER_DEBOUNCE_MS = 30
+const CACHE_DEBOUNCE_MS = 3000, CACHE_MAX_SCREENS = 120
 const DEFAULT_NOTIFY_MS = 5000
 
 interface Overlay { text: string; title?: string; timer: NodeJS.Timeout }
@@ -33,6 +34,9 @@ export class Shell extends EventEmitter {
   /** ad-hoc view pushed through the API */
   scratch: View | null = null
   lastEvent: (NormalizedEvent & { ts: number; conn: number }) | null = null
+  /** app id → screens currently cached on the phone */
+  readonly cached = new Map<string, number>()
+  private cacheTimers = new Map<string, NodeJS.Timeout>()
   lastView: View | null = null
   /** display off: blank screen until the next gesture */
   blank = false
@@ -54,6 +58,7 @@ export class Shell extends EventEmitter {
     super()
     this.registry = new AppRegistry(appsDir, {
       requestRender: (id) => { if (this.isActive(id)) this.requestRender() },
+      requestCache: (id) => this.scheduleCache(id),
       isActive: (id) => this.isActive(id),
       notify: (text, opts) => this.notify(text, opts),
       open: (id) => this.open(id),
@@ -167,6 +172,8 @@ export class Shell extends EventEmitter {
     this.emit('connection', { type: 'open', conn: conn.summary() })
     this.syncRefresh()
     this.requestRender()
+    // top the phone's offline packs up once the dashboard is on screen
+    setTimeout(() => { void this.pushAllCaches() }, 4000)
   }
   removeConnection(conn: Connection): void {
     this.connections.delete(conn)
@@ -589,6 +596,37 @@ export class Shell extends EventEmitter {
     const app = this.activeApp
     if (app) this.safe(app, 'onLocation', loc)
     this.emit('location', loc)
+  }
+
+  // ── offline packs ───────────────────────────────────────────────
+  /** Build an app's pack soon (several state changes collapse into one push). */
+  scheduleCache(id: string): void {
+    if (this.cacheTimers.has(id)) return
+    this.cacheTimers.set(id, setTimeout(() => { this.cacheTimers.delete(id); void this.pushCache(id) }, CACHE_DEBOUNCE_MS))
+  }
+  /** Ask an app for its offline pack, pre-render it and store it on the phone. */
+  async pushCache(id: string): Promise<{ key: string; pages: number } | null> {
+    const app = this.registry.get(id)
+    if (!app?.mod?.offline || !app.ctx) return null
+    let pack
+    try { pack = await app.mod.offline.call(app.mod, app.ctx) } catch (err) { log('warn', `app ${id} offline: ${(err as Error).message}`); return null }
+    if (!pack || !Array.isArray(pack.screens) || !pack.screens.length) return null
+    const pages = pack.screens.slice(0, CACHE_MAX_SCREENS).map((v) => compile(v).page)
+    const args = { key: id, title: pack.title || app.title, pages, index: Math.max(0, Math.min(pack.index ?? 0, pages.length - 1)) }
+    this.cached.set(id, pages.length)
+    await Promise.all([...this.connections].map((c) => c.cmd('cache.put', args).catch((err: Error) => log('warn', `conn ${c.id} cache.put ${id}: ${err.message}`))))
+    log('shell', `cached ${pages.length} screen${pages.length === 1 ? '' : 's'} of ${id} on the phone`)
+    return { key: id, pages: pages.length }
+  }
+  /** Push every app that has something to cache (on connect, or on demand). */
+  async pushAllCaches(): Promise<void> {
+    for (const app of this.registry.list()) if (app.mod?.offline) await this.pushCache(app.id)
+  }
+  /** The phone reports where the wearer got to while it was on its own. */
+  handleCachedProgress(key: string, index: number): void {
+    log('shell', `phone read ${key} offline up to screen ${index}`)
+    const app = this.registry.get(key)
+    if (app?.mod?.onCached) this.safe(app, 'onCached', index)
   }
 
   /** Deliver a message to an app (active or not); returns the hook's result. */

@@ -15,6 +15,16 @@ import type { Canvas } from '../server/png.ts'
 
 export type { View, MenuItem, AppEvent }
 
+/** What an app hands the phone to work from offline. */
+export interface OfflinePack {
+  /** shown in the phone's offline picker (defaults to the app title) */
+  title?: string
+  /** one view per screen, in order */
+  screens: View[]
+  /** which screen to open first */
+  index?: number
+}
+
 export interface HttpRequest {
   method: string
   /** path below /api/apps/<id>, e.g. '/hook' — always starts with '/' */
@@ -47,6 +57,8 @@ export interface AppContext<S = Record<string, any>, M = Record<string, any>> {
   /** re-render (if active) and schedule a state save */
   render(): void
   save(): void
+  /** rebuild this app's offline pack and push it to the phone (debounced) */
+  cache(): void
   /** full-screen toast over whatever is showing; tap dismisses */
   notify(text: string, opts?: { title?: string; ms?: number }): void
   /** make an app active (defaults to this one) */
@@ -126,6 +138,14 @@ export interface OmniApp<S = Record<string, any>, M = Record<string, any>> {
   /** POST /api/apps/<id>/message or ctx.message() from another app */
   onMessage?(ctx: AppContext<S, M>, msg: any): unknown
   /** any other request under /api/apps/<id>/… (webhooks, the app's own API) */
+  /**
+   * Pages to keep on the phone for when the server can't be reached (a chapter
+   * and the next few, say). `ctx.cache()` asks for a refresh; the phone shows
+   * them as-is and reports back through `onCached`.
+   */
+  offline?(ctx: AppContext<S, M>): OfflinePack | null | Promise<OfflinePack | null>
+  /** the wearer reached screen `index` of the cached pack while offline */
+  onCached?(ctx: AppContext<S, M>, index: number): void
   http?(ctx: AppContext<S, M>, req: HttpRequest): HttpResponse | Promise<HttpResponse>
   /**
    * Phone-side page for this app (shown in the Omni companion's Apps tab and at

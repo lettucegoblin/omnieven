@@ -194,6 +194,18 @@ Return `true` to consume a gesture. Otherwise the user's **in-app default bindin
 The contextual menu (tap-and-hold on the touchpad) shows your `menu` items first, then
 your settings entry and **Home** (other apps only if the user configured that).
 
+## Working offline
+
+`offline(ctx)` returns pages to keep on the phone — `{ title?, screens: View[], index? }`.
+The server pre-renders them and stores them in the Even App; when the server can't be
+reached the phone shows them on its own (tap/swipe down = next screen, swipe up = previous,
+double-tap = the list of cached apps, then the exit dialog). Call `ctx.cache()` whenever the
+useful window moves (a new reading position, a new note) and the pack is rebuilt, debounced.
+When the connection comes back the phone reports how far the wearer got and the app hears it
+in `onCached(ctx, index)` — map that index back to your own state (a chapter and paragraph,
+say). Up to 120 screens per app; the phone keeps ~3 MB in total and drops the oldest packs.
+`POST /api/cache {"app":"<id>"}` forces a refresh, `GET /api/cache` lists what is stored.
+
 ## Phone page
 
 Apps can have a screen on the **phone** too — the Omni companion (the page the Even app
