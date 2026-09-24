@@ -27,7 +27,7 @@ import { Store } from './store.js'
 
 /** @typedef {{ prep: string, cues: boolean, todos: boolean, lines: number, audio: boolean, engine: 'flux'|'nova-3', repass: boolean }} State */
 /** @typedef {{ type: 'definition'|'recall'|'prep'|'answer'|'person'|'todo'|'reminder', header: string, text: string, source?: string, todo?: { text: string, due?: string }, shownAt: number }} Cue */
-/** @typedef {{ screen: 'idle'|'live'|'confirm'|'review'|'sessions'|'notes'|'note', store: Store | null, notesIndexedAt: number, noteFolder: string, noteList: { path: string, title: string }[], noteWindow: number, note: { title: string, pages: string[] } | null, brainMapRunning: boolean, stream: ReturnType<typeof openStream> | null, sessionId: number,
+/** @typedef {{ screen: 'idle'|'live'|'insight'|'insights'|'confirm'|'review'|'sessions'|'notes'|'note', store: Store | null, notesIndexedAt: number, noteFolder: string, noteList: { path: string, title: string }[], noteWindow: number, note: { title: string, pages: string[] } | null, brainMapRunning: boolean, stream: ReturnType<typeof openStream> | null, sessionId: number,
  *   finals: { t: number, speaker: number | null, text: string }[], interim: string, startedAt: number, error: string, status: string,
  *   cue: Cue | null, cueBusy: boolean, lastCueAt: number, lastCueWords: number, tick: any, keepTick: any,
  *   audioOut: import('node:fs').WriteStream | null, audioPath: string, audioBytes: number, hintT: any,
