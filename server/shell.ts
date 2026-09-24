@@ -38,6 +38,8 @@ export class Shell extends EventEmitter {
   blank = false
   /** folder currently shown on the home screen, e.g. ['Tools', 'Time'] */
   homePath: string[] = []
+  /** the folder the current app was opened from, so leaving it goes back there */
+  private returnPath: string[] = []
   /** the shell-rendered settings screens of the active app (from its `settings` schema) */
   appSettings: { screen: 'list' | 'option'; index: number } | null = null
   config: OmniConfig = loadConfig()
@@ -82,6 +84,8 @@ export class Shell extends EventEmitter {
       setBinding: (scope, gesture, action) => this.setBinding(scope, gesture, action),
       setMenu: (patch) => { this.updateConfig({ menu: { ...this.config.menu, ...patch } }) },
       resetGestures: () => { this.resetGestures(); this.notify('Gestures reset to the standard', { ms: 1500 }) },
+      pinned: () => this.config.pinned,
+      setPinned: (ids) => { this.updateConfig({ pinned: ids }) },
       apps: () => this.registry.list().map((a) => ({ id: a.id, title: a.title, group: a.group })),
       close: () => this.restore(),
     }))
@@ -114,7 +118,7 @@ export class Shell extends EventEmitter {
 
   /** Run a configured action. Returns false for unknown actions. */
   runAction(action: Action): boolean {
-    if (action === 'home') { this.blank = false; this.home(this.activeApp ? this.activeApp.group.split('/').filter(Boolean) : []); return true }
+    if (action === 'home') { this.blank = false; this.home(this.activeId ? this.returnPath : []); return true }
     if (action === 'exit') { void this.exit(); return true }
     if (action === 'quit') { void this.broadcast('shutdown', { mode: 0 }); return true }
     if (action === 'blank') { this.setBlank(!this.blank); return true }
@@ -196,6 +200,9 @@ export class Shell extends EventEmitter {
   open(id: string): void {
     const app = this.registry.get(id)
     if (!app || (app.hidden && id !== SETTINGS_ID)) throw new Error(`no such app: ${id}`)
+    // Remember where we came from, so leaving the app returns to that folder
+    // rather than the top of the tree (a gesture can open an app from anywhere).
+    if (!this.activeId && id !== SETTINGS_ID) this.returnPath = [...this.homePath]
     this.blank = false
     const prev = this.activeApp
     if (prev && prev.id !== id) this.safe(prev, 'onClose')
@@ -315,6 +322,8 @@ export class Shell extends EventEmitter {
     const node = this.homeNode()
     const rows: ({ kind: 'back' } | { kind: 'group'; node: GroupNode } | { kind: 'app'; app: LoadedApp })[] = []
     if (this.homePath.length) rows.push({ kind: 'back' })
+    // Pinned apps come first, in the order the user pinned them (top level only).
+    else for (const id of this.config.pinned) { const a = this.registry.get(id); if (a && !a.hidden) rows.push({ kind: 'app', app: a }) }
     for (const g of [...node.groups.values()].sort((a, b) => a.name.localeCompare(b.name))) rows.push({ kind: 'group', node: g })
     for (const app of node.apps) rows.push({ kind: 'app', app })
     return rows

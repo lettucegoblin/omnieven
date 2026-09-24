@@ -25,6 +25,11 @@ function cleanMenu(m: unknown, base: MenuConfig): MenuConfig {
   }
 }
 
+/** @returns the given list of app ids, deduped, or the current one when absent */
+function cleanIds(v: unknown, base: string[]): string[] {
+  if (!Array.isArray(v)) return base
+  return [...new Set(v.filter((x): x is string => typeof x === 'string' && !!x))]
+}
 function cleanInput(i: unknown, base: InputConfig): InputConfig {
   const o = (i && typeof i === 'object' ? i : {}) as Partial<InputConfig>
   const num = (v: unknown, d: number) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : d)
@@ -43,6 +48,7 @@ export function loadConfig(): OmniConfig {
   const g = saved.gestures || ({} as Partial<OmniConfig['gestures']>)
   return {
     menu: cleanMenu(saved.menu, DEFAULT_CONFIG.menu),
+    pinned: cleanIds(saved.pinned, DEFAULT_CONFIG.pinned),
     input: cleanInput(saved.input, DEFAULT_CONFIG.input),
     gestures: {
       root: { ...DEFAULT_CONFIG.gestures.root, ...cleanBindings(g.root) },
@@ -61,6 +67,7 @@ export function mergeConfig(cfg: OmniConfig, patch: Partial<OmniConfig>): OmniCo
   const g: Partial<OmniConfig['gestures']> = patch.gestures || {}
   return {
     menu: cleanMenu(patch.menu, cfg.menu),
+    pinned: cleanIds(patch.pinned, cfg.pinned),
     input: cleanInput(patch.input, cfg.input),
     gestures: {
       root: { ...cfg.gestures.root, ...cleanBindings(g.root) },

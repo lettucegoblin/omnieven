@@ -18,11 +18,14 @@ export interface SettingsHost {
   setMenu(patch: Partial<OmniConfig['menu']>): void
   /** put every gesture scope back to the defaults (the Even Hub store standard) */
   resetGestures(): void
+  /** apps shown first on the home screen, in order */
+  pinned(): string[]
+  setPinned(ids: string[]): void
   apps(): { id: string; title: string; group: string }[]
   close(): void
 }
 
-interface Mem { level: 'scopes' | 'bindings' | 'gesture' | 'action' | 'app' | 'menu-apps'; scope: Scope; gesture: string }
+interface Mem { level: 'scopes' | 'bindings' | 'gesture' | 'action' | 'app' | 'menu-apps' | 'pins' | 'pin' | 'pin-add'; scope: Scope; gesture: string; pin: number }
 
 const MENU_APPS: { value: OmniConfig['menu']['apps']; label: string }[] = [
   { value: 'none', label: 'none (just the app\'s own items + Home)' },
@@ -33,13 +36,16 @@ const MENU_APPS: { value: OmniConfig['menu']['apps']; label: string }[] = [
 export function makeSettingsApp(host: SettingsHost): OmniApp<{}, Mem> {
   const back = (m: Mem): boolean => {
     if (m.level === 'scopes') { host.close(); return true }
-    m.level = m.level === 'app' ? 'action' : m.level === 'action' || m.level === 'gesture' ? 'bindings' : 'scopes'
+    m.level = m.level === 'app' ? 'action'
+      : m.level === 'action' || m.level === 'gesture' ? 'bindings'
+      : m.level === 'pin' || m.level === 'pin-add' ? 'pins'
+      : 'scopes'
     return true
   }
   return {
     title: 'Settings',
     hidden: true,
-    init(ctx) { ctx.mem.level = 'scopes'; ctx.mem.scope = 'root'; ctx.mem.gesture = '' },
+    init(ctx) { ctx.mem.level = 'scopes'; ctx.mem.scope = 'root'; ctx.mem.gesture = ''; ctx.mem.pin = 0 },
     onOpen(ctx) { ctx.mem.level = 'scopes' },
 
     render(ctx) {
@@ -54,6 +60,7 @@ export function makeSettingsApp(host: SettingsHost): OmniApp<{}, Mem> {
             ...SCOPES.map((s) => `${s.label}  (${s.hint})`),
             `Menu shows other apps:  ${MENU_APPS.find((o) => o.value === cfg.menu.apps)?.label.split(' (')[0]}`,
             `Menu shows Settings item:  ${cfg.menu.settings ? 'yes' : 'no'}`,
+            `Pinned apps on the home screen:  ${host.pinned().length || 'none'}`,
             'Reset gestures to the standard (double-tap = exit dialog)',
           ])] }
         case 'menu-apps':
@@ -69,6 +76,18 @@ export function makeSettingsApp(host: SettingsHost): OmniApp<{}, Mem> {
           return { containers: [header(`${m.scope}: "${m.gesture}" does…`), list(ACTION_CHOICES.map((a) => a.label))] }
         case 'app':
           return { containers: [header(`"${m.gesture}" opens which app?`), list(host.apps().map((a) => (a.group ? `${a.group} / ` : '') + a.title))] }
+        case 'pins': {
+          const titles = host.apps()
+          const rows = host.pinned().map((id, i) => `${i + 1}. ${titles.find((a) => a.id === id)?.title ?? id}`)
+          return { containers: [header('Pinned apps  ·  they open the home list  ·  double-tap: back'), list([...rows, '+ pin an app…'])] }
+        }
+        case 'pin': {
+          const id = host.pinned()[m.pin]
+          const title = host.apps().find((a) => a.id === id)?.title ?? id
+          return { containers: [header(`${title}  ·  double-tap: back`), list(['Move up', 'Move down', 'Unpin'])] }
+        }
+        case 'pin-add':
+          return { containers: [header('Pin which app?  ·  double-tap: back'), list(host.apps().filter((a) => !host.pinned().includes(a.id)).map((a) => (a.group ? `${a.group} / ` : '') + a.title))] }
       }
     },
 
@@ -84,7 +103,31 @@ export function makeSettingsApp(host: SettingsHost): OmniApp<{}, Mem> {
           if (i < SCOPES.length) { m.scope = SCOPES[i].id; m.level = 'bindings' }
           else if (i === SCOPES.length) m.level = 'menu-apps'
           else if (i === SCOPES.length + 1) host.setMenu({ settings: !cfg.menu.settings })
+          else if (i === SCOPES.length + 2) m.level = 'pins'
           else host.resetGestures()
+          break
+        }
+        case 'pins': {
+          const pins = host.pinned()
+          if (ev.index < pins.length) { m.pin = ev.index; m.level = 'pin' }
+          else m.level = 'pin-add'
+          break
+        }
+        case 'pin': {
+          const pins = [...host.pinned()]
+          const i = m.pin
+          if (i >= pins.length) { m.level = 'pins'; break }
+          if (ev.index === 0 && i > 0) { [pins[i - 1], pins[i]] = [pins[i], pins[i - 1]]; m.pin = i - 1 }
+          else if (ev.index === 1 && i < pins.length - 1) { [pins[i + 1], pins[i]] = [pins[i], pins[i + 1]]; m.pin = i + 1 }
+          else if (ev.index === 2) { pins.splice(i, 1); m.level = 'pins' }
+          host.setPinned(pins)
+          break
+        }
+        case 'pin-add': {
+          const choices = host.apps().filter((a) => !host.pinned().includes(a.id))
+          const a = choices[ev.index]
+          if (a) host.setPinned([...host.pinned(), a.id])
+          m.level = 'pins'
           break
         }
         case 'menu-apps': {

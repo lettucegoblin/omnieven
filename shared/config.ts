@@ -55,6 +55,8 @@ export interface InputConfig {
 
 export interface OmniConfig {
   menu: MenuConfig
+  /** app ids shown first on the home screen, in this order */
+  pinned: string[]
   input: InputConfig
   gestures: {
     /** home list, blank screen and API-pushed views — not inside apps */
@@ -70,6 +72,7 @@ export const GESTURE_WINDOW_MS = 1500
 
 export const DEFAULT_CONFIG: OmniConfig = {
   menu: { apps: 'none', pinned: [], settings: false },
+  pinned: [],
   input: { repeatMs: 150, waitForRender: true, maxWaitMs: 2000 },
   gestures: {
     root: { double: 'exit', longpress: 'blank' },
