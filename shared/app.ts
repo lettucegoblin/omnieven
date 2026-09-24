@@ -57,8 +57,12 @@ export interface AppContext<S = Record<string, any>, M = Record<string, any>> {
   /** re-render (if active) and schedule a state save */
   render(): void
   save(): void
-  /** rebuild this app's offline pack and push it to the phone (debounced) */
-  cache(): void
+  /**
+   * Ask for this app's offline pack to be rebuilt and stored on the phone
+   * (debounced), or drop it with `{ clear: true }`. Nothing is cached unless an
+   * app asks — the decision is the app's (and its settings'), not the shell's.
+   */
+  cache(opts?: { clear?: boolean }): void
   /** full-screen toast over whatever is showing; tap dismisses */
   notify(text: string, opts?: { title?: string; ms?: number }): void
   /** make an app active (defaults to this one) */

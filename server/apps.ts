@@ -23,8 +23,8 @@ mkdirSync(APP_DATA_DIR, { recursive: true })
 /** Callbacks the shell provides to app contexts. */
 export interface AppHost {
   requestRender(id: string): void
-  /** rebuild and push this app's offline pack */
-  requestCache(id: string): void
+  /** rebuild and push this app's offline pack (or drop it) */
+  requestCache(id: string, opts?: { clear?: boolean }): void
   isActive(id: string): boolean
   notify(text: string, opts?: { title?: string; ms?: number }): void
   open(id: string): void
@@ -300,7 +300,7 @@ export class AppRegistry extends EventEmitter {
       log: (...a) => log(`app:${app.id}`, a.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')),
       get active() { return host.isActive(app.id) },
       render: () => { persist(); host.requestRender(app.id) },
-      cache: () => host.requestCache(app.id),
+      cache: (opts) => host.requestCache(app.id, opts),
       save: () => persist(),
       notify: (text, opts) => host.notify(text, opts),
       open: (id = app.id) => host.open(id),

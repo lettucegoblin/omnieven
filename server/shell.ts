@@ -58,7 +58,7 @@ export class Shell extends EventEmitter {
     super()
     this.registry = new AppRegistry(appsDir, {
       requestRender: (id) => { if (this.isActive(id)) this.requestRender() },
-      requestCache: (id) => this.scheduleCache(id),
+      requestCache: (id, opts) => { if (opts?.clear) void this.clearCache(id); else this.scheduleCache(id) },
       isActive: (id) => this.isActive(id),
       notify: (text, opts) => this.notify(text, opts),
       open: (id) => this.open(id),
@@ -172,8 +172,6 @@ export class Shell extends EventEmitter {
     this.emit('connection', { type: 'open', conn: conn.summary() })
     this.syncRefresh()
     this.requestRender()
-    // top the phone's offline packs up once the dashboard is on screen
-    setTimeout(() => { void this.pushAllCaches() }, 4000)
   }
   removeConnection(conn: Connection): void {
     this.connections.delete(conn)
@@ -613,14 +611,24 @@ export class Shell extends EventEmitter {
     if (!pack || !Array.isArray(pack.screens) || !pack.screens.length) return null
     const pages = pack.screens.slice(0, CACHE_MAX_SCREENS).map((v) => compile(v).page)
     const args = { key: id, title: pack.title || app.title, pages, index: Math.max(0, Math.min(pack.index ?? 0, pages.length - 1)) }
+    if (!this.connections.size) { log('shell', `offline pack for ${id} not stored: no phone connected`); return null }
+    const results = await Promise.all([...this.connections].map((c) => c.cmd('cache.put', args).then(() => true).catch((err: Error) => { log('warn', `conn ${c.id} cache.put ${id}: ${err.message}`); return false })))
+    if (!results.some(Boolean)) return null
     this.cached.set(id, pages.length)
-    await Promise.all([...this.connections].map((c) => c.cmd('cache.put', args).catch((err: Error) => log('warn', `conn ${c.id} cache.put ${id}: ${err.message}`))))
     log('shell', `cached ${pages.length} screen${pages.length === 1 ? '' : 's'} of ${id} on the phone`)
     return { key: id, pages: pages.length }
   }
-  /** Push every app that has something to cache (on connect, or on demand). */
-  async pushAllCaches(): Promise<void> {
-    for (const app of this.registry.list()) if (app.mod?.offline) await this.pushCache(app.id)
+  /** Every app that offers a pack — only used when something explicitly asks. */
+  async pushAllCaches(): Promise<string[]> {
+    /** @type {string[]} */ const done: string[] = []
+    for (const app of this.registry.list()) if (app.mod?.offline) { const r = await this.pushCache(app.id); if (r) done.push(app.id) }
+    return done
+  }
+  /** Drop one pack from the phone (or all of them). */
+  async clearCache(id?: string): Promise<void> {
+    if (id) this.cached.delete(id); else this.cached.clear()
+    await Promise.all([...this.connections].map((c) => c.cmd('cache.clear', id ? { key: id } : {}).catch(() => {})))
+    log('shell', `cleared ${id ?? 'every'} offline pack from the phone`)
   }
   /** The phone reports where the wearer got to while it was on its own. */
   handleCachedProgress(key: string, index: number): void {
