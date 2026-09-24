@@ -5,7 +5,11 @@
 //
 //   idle    tap: start · menu: Sessions, Clear prep notes
 //   live    captions scroll; a cue appears in the dim box at the bottom
-//           tap: stop · swipe up: accept the suggested to-do (adds to Todoist) · swipe down: dismiss cue
+//           double-tap: end (asks first) · swipe up: accept the suggested to-do
+//           (adds to Todoist) · swipe down: dismiss cue
+//   confirm end the transcription? keep recording / save / discard
+//   The audio is kept alongside the transcript (mp3 when an encoder is installed,
+//   otherwise WAV) so a doubtful line can be listened back to on the phone page.
 //   review  tap: next page · menu: Add all to-dos to Todoist, Add to-do N…, Back
 //   phone   prep notes editor, session history with summaries and transcripts, Conversate import,
 //           brain map (knowledge vault built by brain-map.mjs) browser + "update now"
@@ -14,18 +18,19 @@
 // else the local `claude` CLI. Who-you-are context: data/profile.md.
 
 import { spawn } from 'node:child_process'
-import { existsSync, openSync, readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { openStream } from './deepgram.js'
 import { ask, parseJson } from './llm.js'
 import { Store } from './store.js'
 
-/** @typedef {{ prep: string, cues: boolean, todos: boolean, lines: number }} State */
+/** @typedef {{ prep: string, cues: boolean, todos: boolean, lines: number, audio: boolean }} State */
 /** @typedef {{ type: 'definition'|'recall'|'prep'|'answer'|'person'|'todo'|'reminder', text: string, source?: string, todo?: { text: string, due?: string }, shownAt: number }} Cue */
-/** @typedef {{ screen: 'idle'|'live'|'review'|'sessions'|'notes'|'note', store: Store | null, notesIndexedAt: number, noteFolder: string, noteList: { path: string, title: string }[], noteWindow: number, note: { title: string, pages: string[] } | null, brainMapRunning: boolean, stream: ReturnType<typeof openStream> | null, sessionId: number,
+/** @typedef {{ screen: 'idle'|'live'|'confirm'|'review'|'sessions'|'notes'|'note', store: Store | null, notesIndexedAt: number, noteFolder: string, noteList: { path: string, title: string }[], noteWindow: number, note: { title: string, pages: string[] } | null, brainMapRunning: boolean, stream: ReturnType<typeof openStream> | null, sessionId: number,
  *   finals: { t: number, speaker: number | null, text: string }[], interim: string, startedAt: number, error: string, status: string,
  *   cue: Cue | null, cueBusy: boolean, lastCueAt: number, lastCueWords: number, tick: any, keepTick: any,
+ *   audioOut: import('node:fs').WriteStream | null, audioPath: string, audioBytes: number, hintT: any,
  *   review: import('./store.js').Session | null, page: number, sessions: import('./store.js').Session[], summarizing: boolean, cueHistory?: string[] }} Mem */
 
 const W = 576, H = 288, HEADER = 36, PAD = 4, LINE = 27
@@ -80,6 +85,64 @@ const transcript = (m) => m.finals.map((f) => f.text).join(' ')
 const words = (/** @type {string} */ s) => (s.match(/\S+/g) || []).length
 const stamp = (/** @type {number} */ ms) => `${Math.floor(ms / 60000)}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, '0')}`
 
+// ── the recording ────────────────────────────────────────────────────
+const RATE = 16000, BYTES_PER_SAMPLE = 2
+/** @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx */
+const audioDir = (ctx) => { const d = join(ctx.dataDir, 'audio'); mkdirSync(d, { recursive: true }); return d }
+/** Start writing the mic stream to disk (raw PCM; encoded when the session ends). @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx */
+function startRecording(ctx) {
+  const m = ctx.mem
+  m.audioOut = null; m.audioPath = ''; m.audioBytes = 0
+  if (ctx.state.audio === false) return
+  try {
+    m.audioPath = join(audioDir(ctx), `session-${m.sessionId}.pcm`)
+    m.audioOut = createWriteStream(m.audioPath)
+    m.audioOut.on('error', (err) => { ctx.log(`recording: ${err.message}`); m.audioOut = null })
+  } catch (err) { ctx.log(`recording: ${err instanceof Error ? err.message : err}`) }
+}
+/** @param {string} pcm @param {string} wav @param {number} bytes */
+function pcmToWav(pcm, wav, bytes) {
+  const h = Buffer.alloc(44)
+  h.write('RIFF', 0); h.writeUInt32LE(36 + bytes, 4); h.write('WAVE', 8)
+  h.write('fmt ', 12); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22)
+  h.writeUInt32LE(RATE, 24); h.writeUInt32LE(RATE * BYTES_PER_SAMPLE, 28); h.writeUInt16LE(BYTES_PER_SAMPLE, 32); h.writeUInt16LE(16, 34)
+  h.write('data', 36); h.writeUInt32LE(bytes, 40)
+  return new Promise((res, rej) => {
+    const out = createWriteStream(wav)
+    out.write(h)
+    createReadStream(pcm).pipe(out, { end: true }).on('finish', () => res(wav)).on('error', rej)
+  })
+}
+/** @param {string} bin @param {string[]} args */
+const run = (bin, args) => new Promise((res) => { const p = spawn(bin, args, { stdio: 'ignore' }); p.on('error', () => res(false)); p.on('close', (code) => res(code === 0)) })
+/**
+ * Close the recording and turn it into something playable: mp3 via lame or
+ * ffmpeg when either is installed, otherwise the WAV itself.
+ * @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx @param {boolean} keep
+ * @returns {Promise<{ file: string, secs: number }>}
+ */
+async function finishRecording(ctx, keep) {
+  const m = ctx.mem
+  const out = m.audioOut, pcm = m.audioPath
+  m.audioOut = null; m.audioPath = ''
+  if (!out || !pcm) return { file: '', secs: 0 }
+  await new Promise((res) => out.end(res))
+  const bytes = existsSync(pcm) ? statSync(pcm).size : 0
+  const secs = bytes / (RATE * BYTES_PER_SAMPLE)
+  if (!keep || bytes < RATE) { try { unlinkSync(pcm) } catch {} ; return { file: '', secs: 0 } }
+  const wav = pcm.replace(/\.pcm$/, '.wav')
+  try { await pcmToWav(pcm, wav, bytes) } catch (err) { ctx.log(`recording: ${err instanceof Error ? err.message : err}`); return { file: '', secs } }
+  try { unlinkSync(pcm) } catch {}
+  const mp3 = wav.replace(/\.wav$/, '.mp3')
+  const ok = await run('lame', ['--quiet', '-m', 'm', '-b', '48', wav, mp3]) || await run('ffmpeg', ['-y', '-loglevel', 'error', '-i', wav, '-c:a', 'libmp3lame', '-b:a', '48k', mp3])
+  if (ok && existsSync(mp3)) { try { unlinkSync(wav) } catch {} ; return { file: basename(mp3), secs } }
+  return { file: basename(wav), secs }
+}
+/** Content type from the extension. @param {string} f */
+const audioType = (f) => f.endsWith('.mp3') ? 'audio/mpeg' : f.endsWith('.m4a') ? 'audio/mp4' : f.endsWith('.ogg') ? 'audio/ogg' : 'audio/wav'
+/** @param {number} secs */
+const clock = (secs) => `${Math.floor(secs / 60)}:${String(Math.floor(secs % 60)).padStart(2, '0')}`
+
 // ── live session ─────────────────────────────────────────────────────
 /** @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx */
 async function start(ctx) {
@@ -101,6 +164,7 @@ async function start(ctx) {
     },
     onError: (msg) => { m.error = msg; ctx.log(msg); ctx.render() },
   })
+  startRecording(ctx)
   let ok
   try { ok = await ctx.audio(true, 'glasses') } catch (err) { ok = false; m.error = err instanceof Error ? err.message : String(err) }
   if (!(Array.isArray(ok) ? ok.some(Boolean) : ok)) { m.error ||= 'Mic did not start'; await stop(ctx, false); return }
@@ -112,15 +176,17 @@ async function start(ctx) {
 /** @param {import("../../../shared/app.ts").AppContext<State, Mem>} ctx @param {boolean} [keep] */
 async function stop(ctx, keep = true) {
   const m = ctx.mem
-  if (m.screen !== 'live') return   // already stopping (tap + double-tap, menu + message…)
+  if (m.screen !== 'live' && m.screen !== 'confirm') return   // already stopping
   m.screen = 'review'
   if (m.tick) { ctx.clear(m.tick); m.tick = null }
   try { await ctx.audio(false) } catch {}
   m.stream?.close(); m.stream = null
   const text = transcript(m)
   const s = store(ctx)
-  s.update(m.sessionId, { ended: Date.now(), transcript: text })
-  if (!keep || words(text) < 5) {
+  const rec = await finishRecording(ctx, keep)
+  s.update(m.sessionId, { ended: Date.now(), transcript: text, audio: rec.file, audioSecs: Math.round(rec.secs) })
+  if (!keep) { s.remove(m.sessionId); m.screen = 'idle'; ctx.render(); return }
+  if (words(text) < 5) {
     s.update(m.sessionId, { title: 'Empty session' }); s.finish(m.sessionId)
     m.screen = 'idle'; ctx.render(); return
   }
@@ -231,6 +297,14 @@ function keyTerms(text) {
   return out.slice(-10)
 }
 
+/** Briefly show a hint in the live header. @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx @param {string} text */
+function hint(ctx, text) {
+  const m = ctx.mem
+  m.status = text
+  if (m.hintT) ctx.clear(m.hintT)
+  m.hintT = ctx.setTimeout(() => { if (m.status === text) m.status = 'listening'; ctx.render() }, 3000)
+  ctx.render()
+}
 /** @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx */
 function tick(ctx) {
   const m = ctx.mem
@@ -287,13 +361,15 @@ export default {
     { key: 'cues', label: 'Cues during conversation', options: [{ value: true, label: 'on' }, { value: false, label: 'off' }] },
     { key: 'todos', label: 'Suggest to-dos', options: [{ value: true, label: 'on (swipe up to add)' }, { value: false, label: 'off' }] },
     { key: 'lines', label: 'Caption lines', options: [4, 5, 6].map((v) => ({ value: v, label: `${v}` })) },
+    { key: 'audio', label: 'Keep the recording', options: [{ value: true, label: 'on (listen back later)' }, { value: false, label: 'off' }] },
   ],
   init(ctx) {
-    ctx.state.prep ??= ''; ctx.state.cues ??= true; ctx.state.todos ??= true; ctx.state.lines ??= 6
+    ctx.state.prep ??= ''; ctx.state.cues ??= true; ctx.state.todos ??= true; ctx.state.lines ??= 6; ctx.state.audio ??= true
     const m = ctx.mem
     m.screen = 'idle'; m.finals ??= []; m.interim = ''; m.error = ''; m.status = ''; m.cue = null; m.cueBusy = false
     m.lastCueAt = 0; m.lastCueWords = 0; m.review = null; m.page = 0; m.sessions = []; m.summarizing = false
     m.notesIndexedAt = 0; m.noteFolder = ''; m.noteList = []; m.noteWindow = 0; m.note = null; m.brainMapRunning ??= false
+    m.audioOut = null; m.audioPath = ''; m.audioBytes = 0; m.hintT = null
     setTimeout(() => indexNotes(ctx, true), 500)
   },
   onClose(ctx) { if (ctx.mem.screen === 'live') void stop(ctx) },
@@ -324,18 +400,29 @@ export default {
       const capH = lines * LINE + 2 * PAD
       return {
         containers: [
-          header(`● ${elapsed}  ·  ${words(transcript(m))} words${m.error ? `  ·  ${m.error}` : m.status ? `  ·  ${m.status}` : ''}  ·  tap: stop`),
+          header(`● ${elapsed}  ·  ${words(transcript(m))} words${m.audioOut ? '  ·  rec' : ''}${m.error ? `  ·  ${m.error}` : m.status ? `  ·  ${m.status}` : ''}  ·  double-tap: end`),
           { type: 'text', name: 'captions', x: 0, y: HEADER, w: W, h: capH, padding: PAD, capture: true, text: captions },
           { type: 'text', name: 'cue', x: 0, y: HEADER + capH, w: W, h: CUE_LINES * LINE + 2 * PAD, padding: PAD, textColor: 3, text: ctx.ui.wrap(cueText, W - 16).slice(0, CUE_LINES).join('\n') },
         ],
-        menu: [...(m.cue?.todo ? [{ id: 'add-cue', label: 'Add to-do to Todoist' }] : []), { id: 'stop', label: 'Stop & summarize' }, { id: 'discard', label: 'Stop without saving' }],
+        menu: [...(m.cue?.todo ? [{ id: 'add-cue', label: 'Add to-do to Todoist' }] : []), { id: 'stop', label: 'End & summarize' }, { id: 'discard', label: 'End & discard' }],
+      }
+    }
+
+    if (m.screen === 'confirm') {
+      const secs = (Date.now() - m.startedAt) / 1000
+      return {
+        containers: [header(`End the transcription?  ·  ${clock(secs)}  ·  ${words(transcript(m))} words  ·  still recording`),
+          { type: /** @type {const} */ ('list'), name: 'confirm', x: 0, y: HEADER, w: W, h: H - HEADER, capture: true,
+            items: ['Keep recording', 'End & summarize', 'End & discard (delete the recording)'] }],
+        menu: [{ id: 'resume', label: 'Keep recording' }, { id: 'stop', label: 'End & summarize' }, { id: 'discard', label: 'End & discard' }],
       }
     }
 
     if (m.screen === 'review' && m.review) {
       const r = m.review
       if (m.summarizing) return { containers: [header('Summarizing…'), { type: 'text', name: 'body', x: 0, y: HEADER, w: W, h: H - HEADER, padding: PAD, capture: true, text: `${words(r.transcript)} words saved.\n\nWriting the title, summary and action items…` }] }
-      const body = `${r.summary}${r.actions.length ? `\n\nAction items:\n${r.actions.map((a, i) => `${i + 1}. ${a.text}${a.due ? ` (${a.due})` : ''}`).join('\n')}` : ''}${r.terms.length ? `\n\nTerms:\n${r.terms.map((t) => `${t.term}: ${t.definition}`).join('\n')}` : ''}`
+      const rec = r.audio ? `\n\nRecording: ${clock(r.audioSecs || 0)} — play it on the phone page.` : ''
+      const body = `${r.summary}${rec}${r.actions.length ? `\n\nAction items:\n${r.actions.map((a, i) => `${i + 1}. ${a.text}${a.due ? ` (${a.due})` : ''}`).join('\n')}` : ''}${r.terms.length ? `\n\nTerms:\n${r.terms.map((t) => `${t.term}: ${t.definition}`).join('\n')}` : ''}`
       const pages = ctx.ui.paginate(body, { widthPx: W - 16, lines: Math.floor((H - HEADER - 2 * PAD) / LINE) })
       const page = Math.min(m.page, pages.length - 1)
       return {
@@ -393,10 +480,20 @@ export default {
         if (ev.type === 'tap') { void start(ctx); return true }
         return
       case 'live':
-        if (ev.type === 'tap') { void stop(ctx); return true }
+        // Ending is deliberate: double-tap asks first, a stray tap only reminds you.
+        if (ev.type === 'double') { m.screen = 'confirm'; ctx.render(); return true }
+        if (ev.type === 'tap') { hint(ctx, 'double-tap to end'); return true }
         if (ev.type === 'up') { if (m.cue?.todo) { const t = m.cue.todo; m.cue = null; void addTodo(ctx, t); ctx.render() } return true }
         if (ev.type === 'down') { m.cue = null; ctx.render(); return true }
-        if (ev.type === 'double') { void stop(ctx); return true }   // stop, then the shell's double goes home next time
+        return
+      case 'confirm':
+        if (ev.type === 'select') {
+          if (ev.index === 1) void stop(ctx)
+          else if (ev.index === 2) void stop(ctx, false)
+          else { m.screen = 'live'; ctx.render() }
+          return true
+        }
+        if (ev.type === 'double' || ev.type === 'tap') { m.screen = 'live'; ctx.render(); return true }
         return
       case 'review':
         if (ev.type === 'tap') { m.page++; ctx.render(); return true }
@@ -438,6 +535,7 @@ export default {
     if (id === 'start') return void start(ctx)
     if (id === 'stop') return void stop(ctx)
     if (id === 'discard') return void stop(ctx, false)
+    if (id === 'resume') { if (m.screen === 'confirm') { m.screen = 'live'; ctx.render() } return }
     if (id === 'add-cue' && m.cue?.todo) { const t = m.cue.todo; m.cue = null; ctx.render(); return void addTodo(ctx, t) }
     if (id === 'sessions') { m.sessions = store(ctx).list(20); m.screen = 'sessions'; return ctx.render() }
     if (id === 'knowledge') { indexNotes(ctx, true); m.noteList = store(ctx).listNotes(); m.noteFolder = ''; m.screen = 'notes'; return ctx.render() }
@@ -450,7 +548,11 @@ export default {
     if (id.startsWith('todo-') && m.review) { const a = m.review.actions[Number(id.slice(5))]; if (a) void addTodo(ctx, a) }
   },
 
-  onAudio(ctx, pcm) { ctx.mem.stream?.send(pcm) },
+  onAudio(ctx, pcm) {
+    const m = ctx.mem
+    m.stream?.send(pcm)
+    if (m.audioOut) { m.audioBytes += pcm.length; m.audioOut.write(Buffer.from(pcm)) }
+  },
 
   onMessage(ctx, msg) {
     if (typeof msg.prep === 'string') { ctx.state.prep = msg.prep.slice(0, 4000); ctx.save(); ctx.render() }
@@ -465,6 +567,24 @@ export default {
     if (req.path.startsWith('/session/') && req.method === 'GET') { const x = s.get(Number(req.path.slice(9))); return x ? { session: x } : { status: 404, json: { error: 'no such session' } } }
     if (req.path === '/prep' && req.method === 'POST') { const b = /** @type {any} */ (req.body); ctx.state.prep = String(b?.prep ?? '').slice(0, 4000); ctx.save(); ctx.render(); return { ok: true } }
     if (req.path === '/todo' && req.method === 'POST') { const b = /** @type {any} */ (req.body); if (b?.text) void addTodo(ctx, { text: String(b.text), due: b.due }); return { ok: true } }
+    if (req.path === '/audio') {
+      const dir = join(ctx.dataDir, 'audio')
+      const f = resolve(dir, String(req.query.file || ''))
+      if (!f.startsWith(dir + sep) || !existsSync(f)) return { status: 404, json: { error: 'no such recording' } }
+      const size = statSync(f).size
+      const name = basename(f)
+      const type = audioType(f)
+      const range = String(req.headers.range || '').match(/bytes=(\d*)-(\d*)/)
+      if (range) {
+        const start = range[1] ? Number(range[1]) : 0
+        const end = range[2] ? Math.min(Number(range[2]), size - 1) : size - 1
+        const len = Math.max(0, end - start + 1)
+        const buf = Buffer.alloc(len)
+        const fd = openSync(f, 'r'); readSync(fd, buf, 0, len, start); closeSync(fd)
+        return { status: 206, headers: { 'content-type': type, 'accept-ranges': 'bytes', 'content-range': `bytes ${start}-${end}/${size}`, 'content-length': String(len) }, body: buf }
+      }
+      return { status: 200, headers: { 'content-type': type, 'accept-ranges': 'bytes', 'content-length': String(size), ...(req.query.download ? { 'content-disposition': `attachment; filename="${name}"` } : {}) }, body: readFileSync(f) }
+    }
     if (req.path === '/live') return { screen: ctx.mem.screen, text: transcript(ctx.mem), interim: ctx.mem.interim, cue: ctx.mem.cue }
     if (req.path === '/brain-map' && req.method === 'POST') { const started = runBrainMap(ctx, !!req.query.all); return { ok: started, running: true, ...(started ? {} : { note: 'already running' }) } }
     if (req.path === '/brain-map') return brainMapStatus(ctx)
@@ -493,6 +613,7 @@ export default {
     const sessions = store(ctx).list(30)
     const cards = sessions.map((x) => `<details class="card"><summary><b>${esc(x.title || 'Untitled')}</b> <small class="muted">${new Date(x.started).toLocaleString(ctx.locale, { timeZone: ctx.tz })} · ${words(x.transcript)} words</small></summary>
       <p>${esc(x.summary)}</p>
+      ${x.audio ? `<p class="row"><audio controls preload="none" data-file="${esc(x.audio)}" style="flex:1"></audio><a class="muted" href="#" data-dl="${esc(x.audio)}">download</a> <small class="muted">${clock(x.audioSecs || 0)}</small></p>` : ''}
       ${x.actions.length ? `<ul class="rows">${x.actions.map((a) => `<li><span>${esc(a.text)}${a.due ? ` <small class="muted">· ${esc(a.due)}</small>` : ''}</span><button data-todo="${esc(a.text)}" data-due="${esc(a.due || '')}">→ Todoist</button></li>`).join('')}</ul>` : ''}
       ${x.terms.length ? `<p class="muted">${x.terms.map((t) => `<b>${esc(t.term)}</b> — ${esc(t.definition)}`).join('<br>')}</p>` : ''}
       <details><summary class="muted">Transcript${x.source && x.source !== 'glasses' ? ` (${esc(x.source)})` : ''}</summary><pre>${esc(x.transcript)}</pre></details>
@@ -515,6 +636,8 @@ export default {
       </div>
       ${cards || '<p class="muted">No sessions yet — tap the glasses to start one.</p>'}
       <script>
+        for (const a of document.querySelectorAll('audio[data-file]')) a.src = omni.url('/audio?file=' + encodeURIComponent(a.dataset.file))
+        for (const a of document.querySelectorAll('[data-dl]')) a.href = omni.url('/audio?download=1&file=' + encodeURIComponent(a.dataset.dl))
         const bmStatus = () => omni.api('/brain-map').then((s) => { document.getElementById('bm-status').textContent = (s.running ? '● running… ' : '') + s.notes + ' notes · ' + s.sessionsFolded + ' sessions folded' + (s.lastRun ? ' · last run ' + new Date(s.lastRun.at).toLocaleString() + ' (' + s.lastRun.secs + ' s)' : ''); if (s.running) setTimeout(bmStatus, 5000) })
         bmStatus()
         document.getElementById('bm-run').onclick = () => omni.api('/brain-map', { method: 'POST' }).then(bmStatus)

@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
 
-/** @typedef {{ id: number, started: number, ended: number | null, source: string, location: string, title: string, summary: string, actions: { text: string, due?: string, done?: boolean }[], terms: { term: string, definition: string }[], people: { name: string, role?: string }[], prep: string, transcript: string }} Session */
+/** @typedef {{ id: number, started: number, ended: number | null, source: string, location: string, audio: string, audioSecs: number, title: string, summary: string, actions: { text: string, due?: string, done?: boolean }[], terms: { term: string, definition: string }[], people: { name: string, role?: string }[], prep: string, transcript: string }} Session */
 
 export class Store {
   /** @param {string} dir */
@@ -22,6 +22,8 @@ export class Store {
     this.db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS notes USING fts5(path UNINDEXED, title, text)')
     try { this.db.exec("ALTER TABLE sessions ADD COLUMN source TEXT DEFAULT 'glasses'") } catch {}
     try { this.db.exec("ALTER TABLE sessions ADD COLUMN location TEXT DEFAULT ''") } catch {}
+    try { this.db.exec("ALTER TABLE sessions ADD COLUMN audio TEXT DEFAULT ''") } catch {}
+    try { this.db.exec('ALTER TABLE sessions ADD COLUMN audioSecs INTEGER DEFAULT 0') } catch {}
   }
   /** @param {any} row @returns {Session} */
   static row(row) {
@@ -51,7 +53,8 @@ export class Store {
     const date = new Date(s.started).toISOString().slice(0, 16).replace('T', ' ')
     const slug = (s.title || 'session').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60)
     const md = [
-      `# ${s.title || 'Untitled session'}`, '', `- date: ${date}`, `- session: ${s.id}`, `- source: ${s.source || 'glasses'}`, s.location ? `- location: ${s.location}` : '', '',
+      `# ${s.title || 'Untitled session'}`, '', `- date: ${date}`, `- session: ${s.id}`, `- source: ${s.source || 'glasses'}`, s.location ? `- location: ${s.location}` : '',
+      s.audio ? `- audio: audio/${s.audio}${s.audioSecs ? ` (${Math.floor(s.audioSecs / 60)}m ${Math.round(s.audioSecs % 60)}s)` : ''}` : '', '',
       s.prep ? `## Prep notes\n\n${s.prep}\n` : '',
       `## Summary\n\n${s.summary}\n`,
       s.actions.length ? `## Action items\n\n${s.actions.map((a) => `- [ ] ${a.text}${a.due ? ` (${a.due})` : ''}`).join('\n')}\n` : '',
@@ -78,6 +81,8 @@ export class Store {
   }
   /** @param {number} id */
   remove(id) {
+    const rec = this.get(id)
+    if (rec?.audio) { try { unlinkSync(join(this.dir, 'audio', rec.audio)) } catch {} }
     this.db.prepare('DELETE FROM fts WHERE session_id = ?').run(id)
     this.db.prepare('DELETE FROM sessions WHERE id = ?').run(id)
     const dir = join(this.dir, 'sessions')

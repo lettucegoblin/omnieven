@@ -40,7 +40,15 @@ export function sendResult(res: ServerResponse, result: Exclude<HttpResponse, un
     const status = r.status ?? 200
     if (r.json !== undefined) { sendJson(res, status, r.json); return }
     const body = r.body instanceof Uint8Array ? Buffer.from(r.body) : String(r.body ?? '')
-    res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', ...(r.headers || {}) })
+    // The app's own headers replace the defaults even when their case differs —
+    // two Content-Type headers would otherwise reach the phone (the first wins,
+    // so an audio/image body would arrive as text/plain).
+    const headers: Record<string, string> = { 'Content-Type': 'text/plain; charset=utf-8' }
+    for (const [k, v] of Object.entries(r.headers || {})) {
+      for (const had of Object.keys(headers)) if (had.toLowerCase() === k.toLowerCase()) delete headers[had]
+      headers[k] = String(v)
+    }
+    res.writeHead(status, headers)
     res.end(body); return
   }
   sendJson(res, 200, result)
