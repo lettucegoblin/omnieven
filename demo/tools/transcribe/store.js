@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
 
-/** @typedef {{ id: number, started: number, ended: number | null, source: string, location: string, audio: string, audioSecs: number, title: string, summary: string, actions: { text: string, due?: string, done?: boolean }[], terms: { term: string, definition: string }[], people: { name: string, role?: string }[], prep: string, transcript: string }} Session */
+/** @typedef {{ id: number, started: number, ended: number | null, source: string, location: string, audio: string, audioSecs: number, liveTranscript: string, transcriptSource: string, title: string, summary: string, actions: { text: string, due?: string, done?: boolean }[], terms: { term: string, definition: string }[], people: { name: string, role?: string }[], prep: string, transcript: string }} Session */
 
 export class Store {
   /** @param {string} dir */
@@ -24,6 +24,8 @@ export class Store {
     try { this.db.exec("ALTER TABLE sessions ADD COLUMN location TEXT DEFAULT ''") } catch {}
     try { this.db.exec("ALTER TABLE sessions ADD COLUMN audio TEXT DEFAULT ''") } catch {}
     try { this.db.exec('ALTER TABLE sessions ADD COLUMN audioSecs INTEGER DEFAULT 0') } catch {}
+    try { this.db.exec("ALTER TABLE sessions ADD COLUMN liveTranscript TEXT DEFAULT ''") } catch {}
+    try { this.db.exec("ALTER TABLE sessions ADD COLUMN transcriptSource TEXT DEFAULT 'live'") } catch {}
   }
   /** @param {any} row @returns {Session} */
   static row(row) {
@@ -60,7 +62,7 @@ export class Store {
       s.actions.length ? `## Action items\n\n${s.actions.map((a) => `- [ ] ${a.text}${a.due ? ` (${a.due})` : ''}`).join('\n')}\n` : '',
       s.terms.length ? `## Terms\n\n${s.terms.map((t) => `- **${t.term}** — ${t.definition}`).join('\n')}\n` : '',
       s.people.length ? `## People\n\n${s.people.map((p) => `- ${p.name}${p.role ? ` — ${p.role}` : ''}`).join('\n')}\n` : '',
-      `## Transcript\n\n${s.transcript}`,
+      `## Transcript  <!-- ${s.transcriptSource || 'live'} -->\n\n${s.transcript}`,
     ].filter(Boolean).join('\n')
     // the id keeps two sessions with the same title from sharing a file
     const file = `${date.slice(0, 10)}-${slug || 'session'}-${s.id}.md`

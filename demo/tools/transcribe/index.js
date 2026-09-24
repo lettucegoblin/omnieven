@@ -21,20 +21,28 @@ import { spawn } from 'node:child_process'
 import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { openStream } from './deepgram.js'
+import { openStream, transcribeFile } from './deepgram.js'
 import { ask, parseJson } from './llm.js'
 import { Store } from './store.js'
 
-/** @typedef {{ prep: string, cues: boolean, todos: boolean, lines: number, audio: boolean }} State */
-/** @typedef {{ type: 'definition'|'recall'|'prep'|'answer'|'person'|'todo'|'reminder', text: string, source?: string, todo?: { text: string, due?: string }, shownAt: number }} Cue */
+/** @typedef {{ prep: string, cues: boolean, todos: boolean, lines: number, audio: boolean, engine: 'flux'|'nova-3', repass: boolean }} State */
+/** @typedef {{ type: 'definition'|'recall'|'prep'|'answer'|'person'|'todo'|'reminder', header: string, text: string, source?: string, todo?: { text: string, due?: string }, shownAt: number }} Cue */
 /** @typedef {{ screen: 'idle'|'live'|'confirm'|'review'|'sessions'|'notes'|'note', store: Store | null, notesIndexedAt: number, noteFolder: string, noteList: { path: string, title: string }[], noteWindow: number, note: { title: string, pages: string[] } | null, brainMapRunning: boolean, stream: ReturnType<typeof openStream> | null, sessionId: number,
  *   finals: { t: number, speaker: number | null, text: string }[], interim: string, startedAt: number, error: string, status: string,
  *   cue: Cue | null, cueBusy: boolean, lastCueAt: number, lastCueWords: number, tick: any, keepTick: any,
  *   audioOut: import('node:fs').WriteStream | null, audioPath: string, audioBytes: number, hintT: any,
+ *   insights: Cue[], insightAt: number, level: number, repassing: boolean,
  *   review: import('./store.js').Session | null, page: number, sessions: import('./store.js').Session[], summarizing: boolean, cueHistory?: string[] }} Mem */
 
 const W = 576, H = 288, HEADER = 36, PAD = 4, LINE = 27
-const CUE_EVERY_MS = 12_000, CUE_MIN_WORDS = 12, CUE_TTL_MS = 18_000, CUE_LINES = 2
+const CUE_EVERY_MS = 12_000, CUE_MIN_WORDS = 12, CUE_TTL_MS = 45_000
+// Conversate-style layout: the insight badge sits top left, the clock and the
+// recording meter top right, the live captions on the last few lines.
+// a bordered box needs room for the border too, or the firmware shows a scrollbar
+const BADGE_W = 366, CLOCK_W = 200, BOX_LINE = LINE + 2 * PAD + 4, EXPANDED_H = 4 * LINE + 2 * PAD + 4, LIST_H = 7 * LINE
+const BOX = { width: 1, color: 15, radius: 8 }
+/** Only glyphs the firmware font actually has. */
+const ICON = { definition: '◆', recall: '★', prep: '●', answer: '◇', person: '■', todo: '□', reminder: '▲' }
 const CAPTION_KEEP = 600   // chars of finished text kept on screen (Deepgram gives us the rest)
 
 /** @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx */
@@ -84,6 +92,29 @@ function runBrainMap(ctx, all = false) {
 const transcript = (m) => m.finals.map((f) => f.text).join(' ')
 const words = (/** @type {string} */ s) => (s.match(/\S+/g) || []).length
 const stamp = (/** @type {number} */ ms) => `${Math.floor(ms / 60000)}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, '0')}`
+
+// ── vocabulary ───────────────────────────────────────────────────────
+/**
+ * Names, acronyms and jargon to prime the model with (keyterm prompting):
+ * everything the brain map knows, with whatever the prep notes mention first.
+ * @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx
+ */
+function keytermsFor(ctx) {
+  /** @type {string[]} */ const out = []
+  const prep = (ctx.state.prep || '').toLowerCase()
+  try {
+    indexNotes(ctx)
+    const notes = store(ctx).listNotes().filter((n) => /^(people|tools|terms)\//.test(n.path))
+    const titles = notes.map((n) => n.title.replace(/\s*\(.*\)$/, '').trim()).filter((t) => t && t.length <= 40)
+    const mentioned = titles.filter((t) => prep.includes(t.toLowerCase()))
+    for (const t of [...mentioned, ...titles]) if (!out.some((x) => x.toLowerCase() === t.toLowerCase())) out.push(t)
+  } catch { /* no vault yet */ }
+  // ALL-CAPS acronyms and Capitalised Names straight from the prep notes
+  for (const w of (ctx.state.prep || '').match(/\b([A-Z]{2,6}|[A-Z][a-z]+(?: [A-Z][a-z]+)?)\b/g) || []) {
+    if (!out.some((x) => x.toLowerCase() === w.toLowerCase())) out.unshift(w)
+  }
+  return out.slice(0, 45)
+}
 
 // ── the recording ────────────────────────────────────────────────────
 const RATE = 16000, BYTES_PER_SAMPLE = 2
@@ -149,14 +180,18 @@ async function start(ctx) {
   const m = ctx.mem
   if (!ctx.env.DEEPGRAM_API_KEY) { m.error = 'DEEPGRAM_API_KEY not set in .env'; ctx.render(); return }
   m.finals = []; m.interim = ''; m.error = ''; m.cue = null; m.lastCueAt = Date.now(); m.lastCueWords = 0
+  m.insights = []; m.insightAt = 0; m.level = 0
   m.startedAt = Date.now()
   m.sessionId = store(ctx).create({ started: m.startedAt, prep: ctx.state.prep || '' })
   m.status = 'connecting…'
   m.screen = 'live'; ctx.render()
   m.stream = openStream({
     key: ctx.env.DEEPGRAM_API_KEY,
+    engine: ctx.state.engine || 'flux',
+    keyterms: keytermsFor(ctx),
     log: (t) => ctx.log(t),
     onSegment: (seg) => {
+      // Flux revises the turn in progress, so the interim is the whole turn.
       if (seg.final) { m.finals.push({ t: Date.now() - m.startedAt, speaker: seg.speaker, text: seg.text }); m.interim = '' }
       else m.interim = seg.text
       m.status = ''
@@ -169,14 +204,14 @@ async function start(ctx) {
   try { ok = await ctx.audio(true, 'glasses') } catch (err) { ok = false; m.error = err instanceof Error ? err.message : String(err) }
   if (!(Array.isArray(ok) ? ok.some(Boolean) : ok)) { m.error ||= 'Mic did not start'; await stop(ctx, false); return }
   m.status = 'listening'
-  m.tick = ctx.setInterval(() => tick(ctx), 3000)
+  m.tick = ctx.setInterval(() => tick(ctx), 1000)   // clock + level meter tick; cue timing is by elapsed time
   ctx.render()
 }
 
 /** @param {import("../../../shared/app.ts").AppContext<State, Mem>} ctx @param {boolean} [keep] */
 async function stop(ctx, keep = true) {
   const m = ctx.mem
-  if (m.screen !== 'live' && m.screen !== 'confirm') return   // already stopping
+  if (!['live', 'confirm', 'insight', 'insights'].includes(m.screen)) return   // already stopping
   m.screen = 'review'
   if (m.tick) { ctx.clear(m.tick); m.tick = null }
   try { await ctx.audio(false) } catch {}
@@ -195,6 +230,7 @@ async function stop(ctx, keep = true) {
   s.finish(m.sessionId)
   m.review = s.get(m.sessionId); m.summarizing = false; m.page = 0
   ctx.render()
+  if (ctx.state.repass !== false && rec.file) void rePass(ctx, m.sessionId)
 }
 
 /**
@@ -334,15 +370,16 @@ async function makeCue(ctx) {
   const system = `You whisper one short cue into someone's smart glasses during a live conversation. ${profile(ctx) ? `About them:\n${profile(ctx)}\n` : ''}
 Rules: reply with JSON only. Offer a cue ONLY if it genuinely helps right now; otherwise {"type":"none"}.
 Types: "definition" (a term/acronym just came up that they may need explained), "recall" (something relevant from a past conversation — cite its date), "prep" (a point from their prep notes that fits now), "answer" (a factual question was asked that the material answers), "person" (who a mentioned person is, from past sessions), "todo" (a concrete task for the user emerged — phrase it as an action), "reminder" (an open action item of theirs is relevant).
-"text" ≤ 110 characters, plain, no preamble. For "todo" also give {"todo":{"text":"…","due":"optional"}}. Don't repeat a cue already given. Prefer "none" over noise.
+"header" ≤ 22 characters: the subject alone (a term, a name, "Q4 budget"), no verbs, this is the badge the wearer glances at. "text" ≤ 110 characters, plain, no preamble. For "todo" also give {"todo":{"text":"…","due":"optional"}}. Don't repeat a cue already given. Prefer "none" over noise.
 Never invent facts, numbers, names or sources: "answer", "recall" and "person" may only state what is literally in the prep notes, knowledge-base notes or past-conversation excerpts below (quote the date for recall). If the material doesn't contain it, use "definition" for general knowledge you are sure of, or "none".`
   const prompt = `${ctx.state.prep ? `Prep notes:\n${ctx.state.prep}\n\n` : ''}${vault ? `From the user's knowledge base (curated from past conversations):\n${vault}\n\n` : ''}${past ? `From past conversations:\n${past}\n\n` : ''}${openTodos.length ? `Their open action items:\n${openTodos.map((t) => `- ${t.text}${t.due ? ` (${t.due})` : ''}`).join('\n')}\n\n` : ''}Recent cues already shown: ${m.cueHistory?.slice(-4).join(' | ') || 'none'}\n\nLast ~minute of the conversation (speaker numbers in brackets, 0 is usually the user):\n${recent}\n\nJSON:`
   const raw = await ask(ctx, { model: 'fast', maxTokens: 200, timeoutMs: 15_000, system, prompt })
   const j = parseJson(raw)
   if (!j || !j.type || j.type === 'none' || !j.text || m.screen !== 'live') return
   if (j.type === 'todo' && !ctx.state.todos) return
-  m.cue = { type: j.type, text: String(j.text).slice(0, 140), source: j.source ? String(j.source) : undefined, todo: j.todo && j.todo.text ? { text: String(j.todo.text), due: j.todo.due ? String(j.todo.due) : undefined } : (j.type === 'todo' ? { text: String(j.text) } : undefined), shownAt: Date.now() }
+  m.cue = { type: j.type, header: String(j.header || j.text).replace(/\s+/g, ' ').slice(0, 26), text: String(j.text).slice(0, 140), source: j.source ? String(j.source) : undefined, todo: j.todo && j.todo.text ? { text: String(j.todo.text), due: j.todo.due ? String(j.todo.due) : undefined } : (j.type === 'todo' ? { text: String(j.text) } : undefined), shownAt: Date.now() }
   ;(m.cueHistory ??= []).push(m.cue.text)
+  m.insights.push(m.cue)
   ctx.render()
 }
 
@@ -353,6 +390,90 @@ async function addTodo(ctx, todo) {
   } catch (err) { ctx.notify(`Todoist: ${err instanceof Error ? err.message : err}`, { ms: 2500 }) }
 }
 
+// ── the accurate second pass ─────────────────────────────────────────
+/**
+ * Re-transcribe the saved recording with the pre-recorded model (it sees the
+ * whole conversation, so it is more accurate than the live stream), fix
+ * mis-heard jargon against the brain map, then re-write the summary.
+ * @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx @param {number} id
+ */
+async function rePass(ctx, id) {
+  const m = ctx.mem
+  const s = store(ctx)
+  const sess = s.get(id)
+  if (!sess || !sess.audio || !ctx.env.DEEPGRAM_API_KEY) return
+  const f = join(ctx.dataDir, 'audio', sess.audio)
+  if (!existsSync(f)) return
+  m.repassing = true
+  if (ctx.active) ctx.render()
+  try {
+    const started = Date.now()
+    const r = await transcribeFile({ key: ctx.env.DEEPGRAM_API_KEY, file: readFileSync(f), contentType: audioType(f), keyterms: keytermsFor(ctx) })
+    if (!r.text.trim()) { ctx.log('re-transcribe: nothing came back, keeping the live transcript'); return }
+    let text = r.text, source = 'batch'
+    const fixed = await glossaryFix(ctx, text)
+    if (fixed.changes) { text = fixed.text; source = 'batch+glossary' }
+    s.update(id, { liveTranscript: sess.liveTranscript || sess.transcript, transcript: text, transcriptSource: source })
+    ctx.log(`re-transcribed session ${id} in ${Math.round((Date.now() - started) / 1000)} s (confidence ${r.confidence.toFixed(2)}, ${fixed.changes} glossary fixes)`)
+    await summarize(ctx, id, text, sess.prep)
+    s.finish(id)
+    if (m.review?.id === id) m.review = s.get(id)
+  } catch (err) {
+    ctx.log(`re-transcribe: ${err instanceof Error ? err.message : err}`)
+  } finally {
+    m.repassing = false
+    if (ctx.active) ctx.render()
+  }
+}
+/** Edit distance, for the "does this even sound like it?" check below. @param {string} a @param {string} b */
+function distance(a, b) {
+  const m = a.length, n = b.length
+  if (!m || !n) return Math.max(m, n)
+  let prev = Array.from({ length: n + 1 }, (_, j) => j)
+  for (let i = 1; i <= m; i++) {
+    const cur = [i]
+    for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1))
+    prev = cur
+  }
+  return prev[n]
+}
+/** A replacement is only plausible when the two actually sound close. @param {string} a @param {string} b */
+function couldBeMisheard(a, b) {
+  const x = a.toLowerCase().replace(/[^a-z0-9]/g, ''), y = b.toLowerCase().replace(/[^a-z0-9]/g, '')
+  if (!x || !y || x === y) return false
+  return distance(x, y) <= Math.max(2, Math.ceil(Math.max(x.length, y.length) * 0.34))
+}
+/**
+ * Ask the fast model which mis-hearings to correct against the vault's
+ * vocabulary; the replacements are applied here, so it can't rewrite content.
+ * @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx @param {string} text
+ */
+async function glossaryFix(ctx, text) {
+  const glossary = keytermsFor(ctx)
+  if (!glossary.length || !text.trim()) return { text, changes: 0 }
+  try {
+    const raw = await ask(ctx, {
+      model: 'fast', maxTokens: 800, timeoutMs: 30_000,
+      system: 'You spot words a speech-to-text model mis-heard. Reply with JSON only.',
+      prompt: `Known vocabulary (names, tools, acronyms) from the user's own notes:\n${glossary.join(', ')}\n\nTranscript:\n${text.slice(0, 18000)}\n\nList only clear mis-hearings of the vocabulary above — a word or phrase in the transcript that is obviously the same spoken sound as a known term. Do not fix grammar, do not change meaning, do not invent terms that are not in the list.\nJSON: {"replacements": [{"from": "exact text in the transcript", "to": "correct term"}]}`,
+    })
+    /** @type {any} */ const j = parseJson(raw) || {}
+    let out = text, changes = 0
+    for (const r of Array.isArray(j.replacements) ? j.replacements : []) {
+      const from = String(r?.from || '').trim(), to = String(r?.to || '').trim()
+      if (!from || !to || from.toLowerCase() === to.toLowerCase() || from.length < 2 || from.length > 60) continue
+      if (!glossary.some((g) => g.toLowerCase() === to.toLowerCase())) continue   // only the known vocabulary
+      if (glossary.some((g) => g.toLowerCase() === from.toLowerCase())) continue   // already a known term: leave it alone
+      if (!couldBeMisheard(from, to)) { ctx.log(`glossary: ignored "${from}" → "${to}" (doesn't sound alike)`); continue }
+      const re = new RegExp(`\\b${from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi')
+      const before = out
+      out = out.replace(re, to)
+      if (out !== before) changes++
+    }
+    return { text: out, changes }
+  } catch (err) { ctx.log(`glossary: ${err instanceof Error ? err.message : err}`); return { text, changes: 0 } }
+}
+
 // ── app ──────────────────────────────────────────────────────────────
 /** @type {import('../../../shared/app.ts').OmniApp<State, Mem>} */
 export default {
@@ -360,23 +481,27 @@ export default {
   settings: [
     { key: 'cues', label: 'Cues during conversation', options: [{ value: true, label: 'on' }, { value: false, label: 'off' }] },
     { key: 'todos', label: 'Suggest to-dos', options: [{ value: true, label: 'on (swipe up to add)' }, { value: false, label: 'off' }] },
-    { key: 'lines', label: 'Caption lines', options: [4, 5, 6].map((v) => ({ value: v, label: `${v}` })) },
+    { key: 'lines', label: 'Caption lines', options: [2, 3, 4, 5].map((v) => ({ value: v, label: `${v}` })) },
+    { key: 'engine', label: 'Live model', options: [{ value: 'flux', label: 'Flux (turn-based, revises words)' }, { value: 'nova-3', label: 'Nova-3 (speaker labels)' }] },
+    { key: 'repass', label: 'Re-transcribe afterwards', options: [{ value: true, label: 'on (more accurate)' }, { value: false, label: 'off' }] },
     { key: 'audio', label: 'Keep the recording', options: [{ value: true, label: 'on (listen back later)' }, { value: false, label: 'off' }] },
   ],
   init(ctx) {
-    ctx.state.prep ??= ''; ctx.state.cues ??= true; ctx.state.todos ??= true; ctx.state.lines ??= 6; ctx.state.audio ??= true
+    ctx.state.prep ??= ''; ctx.state.cues ??= true; ctx.state.todos ??= true; ctx.state.lines ??= 3; ctx.state.audio ??= true
+    ctx.state.engine ??= 'flux'; ctx.state.repass ??= true
     const m = ctx.mem
     m.screen = 'idle'; m.finals ??= []; m.interim = ''; m.error = ''; m.status = ''; m.cue = null; m.cueBusy = false
     m.lastCueAt = 0; m.lastCueWords = 0; m.review = null; m.page = 0; m.sessions = []; m.summarizing = false
     m.notesIndexedAt = 0; m.noteFolder = ''; m.noteList = []; m.noteWindow = 0; m.note = null; m.brainMapRunning ??= false
     m.audioOut = null; m.audioPath = ''; m.audioBytes = 0; m.hintT = null
+    m.insights ??= []; m.insightAt = 0; m.level = 0; m.repassing = false
     setTimeout(() => indexNotes(ctx, true), 500)
   },
-  onClose(ctx) { if (ctx.mem.screen === 'live') void stop(ctx) },
+  onClose(ctx) { if (['live', 'confirm', 'insight', 'insights'].includes(ctx.mem.screen)) void stop(ctx) },
   // mem survives a hot reload; drop the Store so the reloaded class is used
   unload(ctx) {
     const m = ctx.mem
-    if (m.screen === 'live') {   // a reload mid-recording: mic off, keep what was heard
+    if (['live', 'confirm', 'insight', 'insights'].includes(m.screen)) {   // a reload mid-recording: mic off, keep what was heard
       void ctx.audio(false)
       try { const s = store(ctx); s.update(m.sessionId, { ended: Date.now(), transcript: transcript(m), title: 'Interrupted by a reload' }); s.finish(m.sessionId) } catch {}
     }
@@ -390,21 +515,41 @@ export default {
     const header = (/** @type {string} */ t) => ({ type: /** @type {const} */ ('text'), name: 'header', x: 0, y: 0, w: W, h: HEADER, padding: PAD, textColor: 2, text: ctx.ui.fit(t, W - 16) })
     if (m.error && m.screen !== 'live') return { text: `Transcribe\n\n${m.error}\n\ntap: back` }
 
-    if (m.screen === 'live') {
-      const lines = Math.min(s.lines, Math.floor((H - HEADER - (CUE_LINES * LINE + 2 * PAD) - 2 * PAD) / LINE))
-      const text = `${transcript(m).slice(-CAPTION_KEEP)} ${m.interim}`.trim()
-      const wrapped = ctx.ui.wrap(text, W - 16)
-      const captions = wrapped.slice(-lines).join('\n') || (m.status || '…')
-      const elapsed = stamp(Date.now() - m.startedAt)
-      const cueText = m.cue ? `${m.cue.type === 'todo' ? 'to-do?  ' : m.cue.type === 'recall' ? '↺ ' : m.cue.type === 'definition' ? '≡ ' : m.cue.type === 'reminder' ? '! ' : ''}${m.cue.text}${m.cue.todo ? '   (swipe up: add to Todoist)' : ''}` : ''
+    if (m.screen === 'live' || m.screen === 'insight' || m.screen === 'insights') {
+      const lines = Math.max(2, Math.min(s.lines || 3, 5))
       const capH = lines * LINE + 2 * PAD
+      const live = `${transcript(m).slice(-CAPTION_KEEP)} ${m.interim}`.trim()
+      const captions = ctx.ui.wrap(live, W - 16).slice(-lines).join('\n') || (m.status || '…')
+      /** @type {import('../../../shared/view.ts').Container[]} */
+      const top = []
+
+      if (m.screen === 'insights') {
+        const rows = m.insights.length
+          ? m.insights.slice(-20).reverse().map((c) => ctx.ui.fit(`${ICON[c.type] || '●'} ${c.header}`, 540))
+          : ['(no insights yet)']
+        top.push({ type: 'list', name: 'insights', x: 0, y: 0, w: W, h: LIST_H, capture: true, items: rows })
+      } else if (m.screen === 'insight') {
+        const c = m.insights[m.insightAt] || m.cue
+        const body = c ? `${ICON[c.type] || '●'} ${c.header}\n${c.text}${c.todo ? '\nswipe up: add to Todoist' : ''}` : '(gone)'
+        top.push({ type: 'text', name: 'insight', x: 0, y: 0, w: W, h: EXPANDED_H, padding: PAD, border: BOX, text: ctx.ui.wrap(body, W - 2 * PAD - 10).slice(0, 4).join('\n') })
+      } else {
+        if (m.cue) top.push({ type: 'text', name: 'badge', x: 0, y: 0, w: BADGE_W, h: BOX_LINE, padding: PAD, border: BOX, text: ctx.ui.fit(`${ICON[m.cue.type] || '●'} ${m.cue.header}`, BADGE_W - 2 * PAD - 10) })
+        else if (m.insights.length) top.push({ type: 'text', name: 'badge', x: 0, y: 0, w: 150, h: BOX_LINE, padding: PAD, textColor: 2, text: `${m.insights.length} insight${m.insights.length > 1 ? 's' : ''}` })
+        const bars = '▌'.repeat(Math.max(1, Math.min(3, 1 + Math.round(m.level * 2))))
+        const time = new Date().toLocaleTimeString(ctx.locale, { hour: 'numeric', minute: '2-digit', timeZone: ctx.tz })
+        top.push({ type: 'text', name: 'clock', x: W - CLOCK_W, y: 0, w: CLOCK_W, h: BOX_LINE, padding: PAD, textColor: 3,
+          text: ctx.ui.align(`${m.audioOut ? '●' : '○'} ${bars}  ${time}`, CLOCK_W - 2 * PAD - 8, 'right') })
+      }
+
       return {
-        containers: [
-          header(`● ${elapsed}  ·  ${words(transcript(m))} words${m.audioOut ? '  ·  rec' : ''}${m.error ? `  ·  ${m.error}` : m.status ? `  ·  ${m.status}` : ''}  ·  double-tap: end`),
-          { type: 'text', name: 'captions', x: 0, y: HEADER, w: W, h: capH, padding: PAD, capture: true, text: captions },
-          { type: 'text', name: 'cue', x: 0, y: HEADER + capH, w: W, h: CUE_LINES * LINE + 2 * PAD, padding: PAD, textColor: 3, text: ctx.ui.wrap(cueText, W - 16).slice(0, CUE_LINES).join('\n') },
+        containers: [...top,
+          { type: 'text', name: 'captions', x: 0, y: H - capH, w: W, h: capH, padding: PAD, capture: m.screen !== 'insights', text: captions }],
+        menu: [
+          ...(m.insights.length ? [{ id: 'insights', label: 'Insights' }] : []),
+          ...((m.screen === 'insight' ? m.insights[m.insightAt]?.todo : m.cue?.todo) ? [{ id: 'add-cue', label: 'Add to-do to Todoist' }] : []),
+          { id: 'stop', label: 'End & summarize' }, { id: 'discard', label: 'End & discard' },
+          ...(m.repassing ? [{ id: 'noop', label: 'Re-transcribing…' }] : []),
         ],
-        menu: [...(m.cue?.todo ? [{ id: 'add-cue', label: 'Add to-do to Todoist' }] : []), { id: 'stop', label: 'End & summarize' }, { id: 'discard', label: 'End & discard' }],
       }
     }
 
@@ -421,7 +566,7 @@ export default {
     if (m.screen === 'review' && m.review) {
       const r = m.review
       if (m.summarizing) return { containers: [header('Summarizing…'), { type: 'text', name: 'body', x: 0, y: HEADER, w: W, h: H - HEADER, padding: PAD, capture: true, text: `${words(r.transcript)} words saved.\n\nWriting the title, summary and action items…` }] }
-      const rec = r.audio ? `\n\nRecording: ${clock(r.audioSecs || 0)} — play it on the phone page.` : ''
+      const rec = r.audio ? `\n\nRecording: ${clock(r.audioSecs || 0)}${m.repassing ? ' · re-transcribing…' : r.transcriptSource && r.transcriptSource !== 'live' ? ` · ${r.transcriptSource} transcript` : ''} — play it on the phone page.` : ''
       const body = `${r.summary}${rec}${r.actions.length ? `\n\nAction items:\n${r.actions.map((a, i) => `${i + 1}. ${a.text}${a.due ? ` (${a.due})` : ''}`).join('\n')}` : ''}${r.terms.length ? `\n\nTerms:\n${r.terms.map((t) => `${t.term}: ${t.definition}`).join('\n')}` : ''}`
       const pages = ctx.ui.paginate(body, { widthPx: W - 16, lines: Math.floor((H - HEADER - 2 * PAD) / LINE) })
       const page = Math.min(m.page, pages.length - 1)
@@ -480,11 +625,33 @@ export default {
         if (ev.type === 'tap') { void start(ctx); return true }
         return
       case 'live':
-        // Ending is deliberate: double-tap asks first, a stray tap only reminds you.
-        if (ev.type === 'double') { m.screen = 'confirm'; ctx.render(); return true }
-        if (ev.type === 'tap') { hint(ctx, 'double-tap to end'); return true }
+        // tap opens the insight on the badge, double-tap the list of them all
+        if (ev.type === 'tap') {
+          if (m.cue) { m.insightAt = Math.max(0, m.insights.lastIndexOf(m.cue)); m.screen = 'insight'; ctx.render() }
+          else if (m.insights.length) { m.screen = 'insights'; ctx.render() }
+          else hint(ctx, 'menu: end · insights appear here')
+          return true
+        }
+        if (ev.type === 'double') { m.screen = 'insights'; ctx.render(); return true }
         if (ev.type === 'up') { if (m.cue?.todo) { const t = m.cue.todo; m.cue = null; void addTodo(ctx, t); ctx.render() } return true }
         if (ev.type === 'down') { m.cue = null; ctx.render(); return true }
+        return
+      case 'insight': {
+        const c = m.insights[m.insightAt]
+        if (ev.type === 'tap') { m.screen = 'live'; ctx.render(); return true }
+        if (ev.type === 'double') { m.screen = 'insights'; ctx.render(); return true }
+        if (ev.type === 'up') { if (c?.todo) { void addTodo(ctx, c.todo); if (m.cue === c) m.cue = null; m.screen = 'live'; ctx.render() } return true }
+        if (ev.type === 'down') { if (m.cue === c) m.cue = null; m.screen = 'live'; ctx.render(); return true }
+        return
+      }
+      case 'insights':
+        if (ev.type === 'select') {
+          const shown = m.insights.slice(-20).reverse()
+          const c = shown[ev.index]
+          if (c) { m.insightAt = m.insights.lastIndexOf(c); m.screen = 'insight'; ctx.render() }
+          return true
+        }
+        if (ev.type === 'double' || ev.type === 'tap') { m.screen = 'live'; ctx.render(); return true }
         return
       case 'confirm':
         if (ev.type === 'select') {
@@ -536,6 +703,8 @@ export default {
     if (id === 'stop') return void stop(ctx)
     if (id === 'discard') return void stop(ctx, false)
     if (id === 'resume') { if (m.screen === 'confirm') { m.screen = 'live'; ctx.render() } return }
+    if (id === 'insights') { m.screen = 'insights'; ctx.render(); return }
+    if (id === 'noop') return
     if (id === 'add-cue' && m.cue?.todo) { const t = m.cue.todo; m.cue = null; ctx.render(); return void addTodo(ctx, t) }
     if (id === 'sessions') { m.sessions = store(ctx).list(20); m.screen = 'sessions'; return ctx.render() }
     if (id === 'knowledge') { indexNotes(ctx, true); m.noteList = store(ctx).listNotes(); m.noteFolder = ''; m.screen = 'notes'; return ctx.render() }
@@ -552,9 +721,22 @@ export default {
     const m = ctx.mem
     m.stream?.send(pcm)
     if (m.audioOut) { m.audioBytes += pcm.length; m.audioOut.write(Buffer.from(pcm)) }
+    const buf = Buffer.from(pcm)
+    let sum = 0
+    for (let i = 0; i + 1 < buf.length; i += 2) { const v = buf.readInt16LE(i) / 32768; sum += v * v }
+    const rms = Math.sqrt(sum / Math.max(1, buf.length / 2))
+    m.level = Math.max(m.level * 0.7, Math.min(1, rms * 6))   // decay, so the meter falls back
   },
 
   onMessage(ctx, msg) {
+    // {"insight":{"type":"recall","header":"SAP feed outage","text":"…"}} — used by
+    // the demo/test harness and by other apps that want to raise something.
+    if (msg?.insight?.header) {
+      const i = msg.insight
+      /** @type {Cue} */ const cue = { type: i.type || 'prep', header: String(i.header).slice(0, 26), text: String(i.text || i.header).slice(0, 140), todo: i.todo, shownAt: Date.now() }
+      ctx.mem.insights.push(cue); ctx.mem.cue = cue
+      ctx.render()
+    }
     if (typeof msg.prep === 'string') { ctx.state.prep = msg.prep.slice(0, 4000); ctx.save(); ctx.render() }
     if (msg.start && ctx.mem.screen === 'idle') { ctx.open(); void start(ctx) }
     if (msg.stop && ctx.mem.screen === 'live') void stop(ctx)
@@ -590,6 +772,12 @@ export default {
     if (req.path === '/brain-map') return brainMapStatus(ctx)
     if (req.path === '/notes') { indexNotes(ctx); return { notes: s.listNotes() } }
     if (req.path === '/note') { const t = s.readNote(String(req.query.path || '')); return t == null ? { status: 404, json: { error: 'no such note' } } : { status: 200, headers: { 'content-type': 'text/markdown; charset=utf-8' }, body: t } }
+    if (req.path === '/repass' && req.method === 'POST') {
+      const id = Number(req.query.id || /** @type {any} */ (req.body)?.id)
+      if (!s.get(id)) return { status: 404, json: { error: 'no such session' } }
+      void rePass(ctx, id)
+      return { ok: true, running: true }
+    }
     if (req.path === '/resummarize' && req.method === 'POST') {
       const id = Number(req.query.id || /** @type {any} */ (req.body)?.id)
       const x = s.get(id)
@@ -614,6 +802,8 @@ export default {
     const cards = sessions.map((x) => `<details class="card"><summary><b>${esc(x.title || 'Untitled')}</b> <small class="muted">${new Date(x.started).toLocaleString(ctx.locale, { timeZone: ctx.tz })} · ${words(x.transcript)} words</small></summary>
       <p>${esc(x.summary)}</p>
       ${x.audio ? `<p class="row"><audio controls preload="none" data-file="${esc(x.audio)}" style="flex:1"></audio><a class="muted" href="#" data-dl="${esc(x.audio)}">download</a> <small class="muted">${clock(x.audioSecs || 0)}</small></p>` : ''}
+      <p class="muted">transcript: ${esc(x.transcriptSource || 'live')}${x.audio ? ` · <a href="#" data-repass="${x.id}">re-transcribe</a>` : ''}${x.liveTranscript ? ' · <a href="#" data-live="' + x.id + '">show the live one</a>' : ''}</p>
+      ${x.liveTranscript ? `<details id="live-${x.id}"><summary class="muted">live transcript (before the second pass)</summary><pre style="white-space:pre-wrap">${esc(x.liveTranscript)}</pre></details>` : ''}
       ${x.actions.length ? `<ul class="rows">${x.actions.map((a) => `<li><span>${esc(a.text)}${a.due ? ` <small class="muted">· ${esc(a.due)}</small>` : ''}</span><button data-todo="${esc(a.text)}" data-due="${esc(a.due || '')}">→ Todoist</button></li>`).join('')}</ul>` : ''}
       ${x.terms.length ? `<p class="muted">${x.terms.map((t) => `<b>${esc(t.term)}</b> — ${esc(t.definition)}`).join('<br>')}</p>` : ''}
       <details><summary class="muted">Transcript${x.source && x.source !== 'glasses' ? ` (${esc(x.source)})` : ''}</summary><pre>${esc(x.transcript)}</pre></details>
@@ -638,6 +828,7 @@ export default {
       <script>
         for (const a of document.querySelectorAll('audio[data-file]')) a.src = omni.url('/audio?file=' + encodeURIComponent(a.dataset.file))
         for (const a of document.querySelectorAll('[data-dl]')) a.href = omni.url('/audio?download=1&file=' + encodeURIComponent(a.dataset.dl))
+        for (const a of document.querySelectorAll('[data-repass]')) a.onclick = (e) => { e.preventDefault(); a.textContent = 're-transcribing…'; omni.api('/repass?id=' + a.dataset.repass, { method: 'POST' }).then(() => setTimeout(omni.reload, 20000)) }
         const bmStatus = () => omni.api('/brain-map').then((s) => { document.getElementById('bm-status').textContent = (s.running ? '● running… ' : '') + s.notes + ' notes · ' + s.sessionsFolded + ' sessions folded' + (s.lastRun ? ' · last run ' + new Date(s.lastRun.at).toLocaleString() + ' (' + s.lastRun.secs + ' s)' : ''); if (s.running) setTimeout(bmStatus, 5000) })
         bmStatus()
         document.getElementById('bm-run').onclick = () => omni.api('/brain-map', { method: 'POST' }).then(bmStatus)
