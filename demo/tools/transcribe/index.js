@@ -19,7 +19,7 @@
 // else the local `claude` CLI. Who-you-are context: data/profile.md.
 
 import { spawn } from 'node:child_process'
-import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { closeSync, createReadStream, createWriteStream, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { openStream, transcribeFile } from './deepgram.js'
@@ -31,7 +31,7 @@ import { Store } from './store.js'
 /** @typedef {{ screen: 'idle'|'live'|'insight'|'insights'|'confirm'|'review'|'sessions'|'notes'|'note', store: Store | null, notesIndexedAt: number, noteFolder: string, noteList: { path: string, title: string }[], noteWindow: number, note: { title: string, pages: string[] } | null, brainMapRunning: boolean, stream: ReturnType<typeof openStream> | null, sessionId: number,
  *   finals: { t: number, speaker: number | null, text: string }[], interim: string, startedAt: number, error: string, status: string,
  *   cue: Cue | null, cueBusy: boolean, lastCueAt: number, lastCueWords: number, tick: any, keepTick: any,
- *   audioOut: import('node:fs').WriteStream | null, audioPath: string, audioBytes: number, hintT: any,
+ *   audioFd: number | null, audioPath: string, audioBytes: number, syncAt: number, hintT: any,
  *   micOn: boolean, lastAudioAt: number, resuming: boolean, resumeAt: number, checkpointAt: number,
  *   insights: Cue[], insightAt: number, level: number, repassing: boolean,
  *   review: import('./store.js').Session | null, page: number, sessions: import('./store.js').Session[], summarizing: boolean, cueHistory?: string[] }} Mem */
@@ -43,7 +43,9 @@ const AUDIO_GAP_MS = 6000, RESUME_EVERY_MS = 15_000
 /** a session that has heard nothing for this long is wrapped up by itself */
 const PAUSE_END_MS = 5 * 60_000
 /** the transcript so far is written to the database this often, so a crash keeps it */
-const CHECKPOINT_MS = 30_000
+const CHECKPOINT_MS = 15_000
+/** the recording is flushed to the disk this often, so a power cut keeps it */
+const AUDIO_SYNC_MS = 20_000
 // Conversate-style layout: the insight badge sits top left, the clock and the
 // recording meter top right, the live captions on the last few lines.
 // a bordered box needs room for the border too, or the firmware shows a scrollbar
@@ -140,13 +142,38 @@ const audioDir = (ctx) => { const d = join(ctx.dataDir, 'audio'); mkdirSync(d, {
 /** Start writing the mic stream to disk (raw PCM; encoded when the session ends). @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx */
 function startRecording(ctx) {
   const m = ctx.mem
-  m.audioOut = null; m.audioPath = ''; m.audioBytes = 0
+  closeRecording(ctx)
+  m.audioPath = ''; m.audioBytes = 0; m.syncAt = Date.now()
   if (ctx.state.audio === false) return
   try {
     m.audioPath = join(audioDir(ctx), `session-${m.sessionId}.pcm`)
-    m.audioOut = createWriteStream(m.audioPath)
-    m.audioOut.on('error', (err) => { ctx.log(`recording: ${err.message}`); m.audioOut = null })
-  } catch (err) { ctx.log(`recording: ${err instanceof Error ? err.message : err}`) }
+    // A plain descriptor written synchronously: every chunk is handed to the
+    // kernel as it arrives, so a killed process loses nothing (a stream would
+    // keep the tail in memory). fsync every so often covers a power cut too.
+    m.audioFd = openSync(m.audioPath, 'a')
+  } catch (err) { ctx.log(`recording: ${err instanceof Error ? err.message : err}`); m.audioFd = null }
+}
+/** @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx */
+function closeRecording(ctx) {
+  const m = ctx.mem
+  if (m.audioFd == null) return
+  try { fsyncSync(m.audioFd) } catch {}
+  try { closeSync(m.audioFd) } catch {}
+  m.audioFd = null
+}
+/** Append a chunk of microphone audio. @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx @param {Buffer} buf */
+function writeAudio(ctx, buf) {
+  const m = ctx.mem
+  if (m.audioFd == null) return
+  try {
+    writeSync(m.audioFd, buf)
+    m.audioBytes += buf.length
+    if (Date.now() - (m.syncAt || 0) > AUDIO_SYNC_MS) { m.syncAt = Date.now(); fsyncSync(m.audioFd) }
+  } catch (err) {
+    ctx.log(`recording: ${err instanceof Error ? err.message : err}`)
+    m.status = 'recording failed — the transcript continues'
+    closeRecording(ctx)
+  }
 }
 /** @param {string} pcm @param {string} wav @param {number} bytes */
 function pcmToWav(pcm, wav, bytes) {
@@ -171,10 +198,10 @@ const run = (bin, args) => new Promise((res) => { const p = spawn(bin, args, { s
  */
 async function finishRecording(ctx, keep) {
   const m = ctx.mem
-  const out = m.audioOut, pcm = m.audioPath
-  m.audioOut = null; m.audioPath = ''
-  if (!out || !pcm) return { file: '', secs: 0 }
-  await new Promise((res) => out.end(res))
+  const pcm = m.audioPath
+  closeRecording(ctx)
+  m.audioPath = ''
+  if (!pcm) return { file: '', secs: 0 }
   if (!keep) { try { unlinkSync(pcm) } catch {} ; return { file: '', secs: 0 } }
   return encodeRecording(ctx, pcm)
 }
@@ -210,8 +237,14 @@ async function recoverUnfinished(ctx) {
     if (sess.id === ctx.mem.sessionId) continue        // this one is live right now
     if (Date.now() - sess.started < 10_000) continue   // just created by someone else
     try {
-      const pcm = join(audioDir(ctx), `session-${sess.id}.pcm`)
-      const rec = existsSync(pcm) ? await encodeRecording(ctx, pcm) : { file: sess.audio || '', secs: sess.audioSecs || 0 }
+      // whatever the crash left behind: raw chunks, a half-made wav, or an mp3
+      const dir = audioDir(ctx)
+      const pcm = join(dir, `session-${sess.id}.pcm`), wav = join(dir, `session-${sess.id}.wav`), mp3 = join(dir, `session-${sess.id}.mp3`)
+      let rec = { file: '', secs: 0 }
+      if (existsSync(pcm)) rec = await encodeRecording(ctx, pcm)
+      else if (existsSync(wav)) rec = { file: basename(wav), secs: statSync(wav).size / (RATE * BYTES_PER_SAMPLE) }
+      else if (existsSync(mp3)) rec = { file: basename(mp3), secs: sess.audioSecs || 0 }
+      else if (sess.audio && existsSync(join(dir, sess.audio))) rec = { file: sess.audio, secs: sess.audioSecs || 0 }
       s.update(sess.id, { ended: sess.started + Math.round(rec.secs * 1000), audio: rec.file, audioSecs: Math.round(rec.secs) })
       ctx.log(`recovering session ${sess.id} (${Math.round(rec.secs)} s of audio)`)
       if (rec.file) await rePass(ctx, sess.id)
@@ -624,7 +657,7 @@ export default {
     m.screen = 'idle'; m.finals ??= []; m.interim = ''; m.error = ''; m.status = ''; m.cue = null; m.cueBusy = false
     m.lastCueAt = 0; m.lastCueWords = 0; m.review = null; m.page = 0; m.sessions = []; m.summarizing = false
     m.notesIndexedAt = 0; m.noteFolder = ''; m.noteList = []; m.noteWindow = 0; m.note = null; m.brainMapRunning ??= false
-    m.audioOut = null; m.audioPath = ''; m.audioBytes = 0; m.hintT = null
+    m.audioFd = null; m.audioPath = ''; m.audioBytes = 0; m.syncAt = 0; m.hintT = null
     m.micOn ??= false; m.lastAudioAt ??= 0; m.resuming = false; m.resumeAt ??= 0; m.checkpointAt = 0
     setTimeout(() => { void recoverUnfinished(ctx) }, 4000)   // pick up anything a crash left behind
     m.insights ??= []; m.insightAt = 0; m.level = 0; m.repassing = false
@@ -638,6 +671,7 @@ export default {
       void ctx.audio(false)
       try { const s = store(ctx); s.update(m.sessionId, { ended: Date.now(), transcript: transcript(m), title: 'Interrupted by a reload' }); s.finish(m.sessionId) } catch {}
     }
+    closeRecording(ctx)
     m.stream?.close(); m.stream = null
     try { m.store?.db.close() } catch {}
     m.store = null
@@ -863,7 +897,7 @@ export default {
     m.lastAudioAt = Date.now()
     if (!m.micOn) { m.micOn = true; m.status = 'listening' }
     m.stream?.send(pcm)
-    if (m.audioOut) { m.audioBytes += pcm.length; m.audioOut.write(Buffer.from(pcm)) }
+    writeAudio(ctx, Buffer.from(pcm))
     const buf = Buffer.from(pcm)
     let sum = 0
     for (let i = 0; i + 1 < buf.length; i += 2) { const v = buf.readInt16LE(i) / 32768; sum += v * v }
