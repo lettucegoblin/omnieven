@@ -42,6 +42,8 @@ export class Connection extends EventEmitter {
   private rendering = false
   /** when the in-flight render started (0 = idle); used for input debouncing */
   busySince = 0
+  /** consecutive failed page builds; after a few we stop trying until the client comes back */
+  private pageFailures = 0
   /** heartbeat: set false on ping, true on pong; two misses = dead */
   alivePing = true
   /** the last gesture accepted from this client (input debouncing is per client) */
@@ -52,7 +54,7 @@ export class Connection extends EventEmitter {
   constructor(ws: WebSocket, remote: string) { super(); this.ws = ws; this.remote = remote }
 
   /** Called when the client's page state is unknown; forces a full rebuild. */
-  resetPage(): void { this.committed = null }
+  resetPage(): void { this.committed = null; this.pageFailures = 0 }
 
   send(frame: ServerFrame): boolean {
     if (this.ws.readyState !== 1) return false
@@ -108,7 +110,7 @@ export class Connection extends EventEmitter {
       for (const { op, args } of ops) {
         try {
           await this.cmd(op, args as never)
-          if (op === 'page') this.pageCreated = true
+          if (op === 'page') { this.pageCreated = true; this.pageFailures = 0 }
         } catch (err) {
           ok = false
           log('warn', `conn ${this.id} ${op} failed: ${(err as Error).message}`)
@@ -117,7 +119,13 @@ export class Connection extends EventEmitter {
           // next gesture or refresh).
           this.committed = null
           this.wantView = this.wantView ?? view
-          if (op === 'page') await new Promise((r) => setTimeout(r, 1500))   // don't hammer a failing link
+          if (op === 'page') {
+            // The glasses page is gone (the Even app ejected it, the link is
+            // wedged): back off, and stop after a few tries — the client will
+            // say hello again when it recovers, and that resets us.
+            if (++this.pageFailures >= 5) { log('warn', `conn ${this.id}: page build failed ${this.pageFailures}×, waiting for the client to come back`); this.wantView = null; return }
+            await new Promise((r) => setTimeout(r, Math.min(8000, 1500 * this.pageFailures)))
+          }
           break
         }
       }

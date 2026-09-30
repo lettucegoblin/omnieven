@@ -32,11 +32,14 @@ import { Store } from './store.js'
  *   finals: { t: number, speaker: number | null, text: string }[], interim: string, startedAt: number, error: string, status: string,
  *   cue: Cue | null, cueBusy: boolean, lastCueAt: number, lastCueWords: number, tick: any, keepTick: any,
  *   audioOut: import('node:fs').WriteStream | null, audioPath: string, audioBytes: number, hintT: any,
+ *   micOn: boolean, lastAudioAt: number, resuming: boolean, resumeAt: number,
  *   insights: Cue[], insightAt: number, level: number, repassing: boolean,
  *   review: import('./store.js').Session | null, page: number, sessions: import('./store.js').Session[], summarizing: boolean, cueHistory?: string[] }} Mem */
 
 const W = 576, H = 288, HEADER = 36, PAD = 4, LINE = 27
 const CUE_EVERY_MS = 12_000, CUE_MIN_WORDS = 12, CUE_TTL_MS = 45_000
+/** the mic feeds us every ~100 ms: a longer gap means the phone went away */
+const AUDIO_GAP_MS = 6000, RESUME_EVERY_MS = 15_000
 // Conversate-style layout: the insight badge sits top left, the clock and the
 // recording meter top right, the live captions on the last few lines.
 // a bordered box needs room for the border too, or the firmware shows a scrollbar
@@ -214,6 +217,7 @@ async function start(ctx) {
   try { ok = await ctx.audio(true, 'glasses') } catch (err) { ok = false; m.error = err instanceof Error ? err.message : String(err) }
   if (!(Array.isArray(ok) ? ok.some(Boolean) : ok)) { m.error ||= 'Mic did not start'; await stop(ctx, false); return }
   m.status = 'listening'
+  m.micOn = true; m.lastAudioAt = Date.now(); m.resumeAt = 0
   m.tick = ctx.setInterval(() => tick(ctx), 1000)   // clock + level meter tick; cue timing is by elapsed time
   ctx.render()
 }
@@ -222,25 +226,67 @@ async function start(ctx) {
 async function stop(ctx, keep = true) {
   const m = ctx.mem
   if (!['live', 'confirm', 'insight', 'insights'].includes(m.screen)) return   // already stopping
+  // Everything below belongs to *this* session: summarising takes a while, and
+  // a new recording may have started by the time it finishes.
+  const id = m.sessionId
   m.screen = 'review'
   if (m.tick) { ctx.clear(m.tick); m.tick = null }
   try { await ctx.audio(false) } catch {}
+  m.micOn = false
   m.stream?.close(); m.stream = null
   const text = transcript(m)
   const s = store(ctx)
   const rec = await finishRecording(ctx, keep)
-  s.update(m.sessionId, { ended: Date.now(), transcript: text, audio: rec.file, audioSecs: Math.round(rec.secs) })
-  if (!keep) { s.remove(m.sessionId); m.screen = 'idle'; ctx.render(); return }
+  s.update(id, { ended: Date.now(), transcript: text, audio: rec.file, audioSecs: Math.round(rec.secs) })
+  if (!keep) { s.remove(id); m.screen = 'idle'; ctx.render(); return }
   if (words(text) < 5) {
-    s.update(m.sessionId, { title: 'Empty session' }); s.finish(m.sessionId)
+    s.update(id, { title: 'Empty session' }); s.finish(id)
     m.screen = 'idle'; ctx.render(); return
   }
-  m.summarizing = true; m.screen = 'review'; m.review = s.get(m.sessionId); m.page = 0; ctx.render()
-  await summarize(ctx, m.sessionId, text, ctx.state.prep || '')
-  s.finish(m.sessionId)
-  m.review = s.get(m.sessionId); m.summarizing = false; m.page = 0
-  ctx.render()
-  if (ctx.state.repass !== false && rec.file) void rePass(ctx, m.sessionId)
+  m.summarizing = true; m.screen = 'review'; m.review = s.get(id); m.page = 0; ctx.render()
+  await summarize(ctx, id, text, ctx.state.prep || '')
+  s.finish(id)
+  m.summarizing = false
+  if (m.sessionId === id) { m.review = s.get(id); m.page = 0; ctx.render() }
+  if (ctx.state.repass !== false && rec.file) void rePass(ctx, id)
+}
+
+/**
+ * Put the microphone and the transcription socket back after the phone went
+ * away (dropped link, the Even app restarted, the glasses ejected the page).
+ * The transcript so far and the recording on disk are kept.
+ * @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx
+ */
+async function resume(ctx) {
+  const m = ctx.mem
+  if (m.resuming || !['live', 'confirm', 'insight', 'insights'].includes(m.screen)) return false
+  m.resuming = true
+  m.status = 'reconnecting…'; ctx.render()
+  try {
+    m.stream?.close()
+    m.stream = openStream({
+      key: ctx.env.DEEPGRAM_API_KEY || '',
+      engine: ctx.state.engine || 'flux',
+      keyterms: keytermsFor(ctx),
+      log: (t) => ctx.log(t),
+      onSegment: (seg) => {
+        if (seg.final) { m.finals.push({ t: Date.now() - m.startedAt, speaker: seg.speaker, text: seg.text }); m.interim = '' }
+        else m.interim = seg.text
+        m.status = ''
+        ctx.render()
+      },
+      onError: (msg) => { m.error = msg; ctx.log(msg); ctx.render() },
+    })
+    let ok
+    try { ok = await ctx.audio(true, 'glasses') } catch { ok = false }
+    m.micOn = Array.isArray(ok) ? ok.some(Boolean) : !!ok
+    if (!m.micOn) { m.status = 'paused — tap to resume'; ctx.render(); return false }
+    m.error = ''; m.status = 'listening'; m.lastAudioAt = Date.now()
+    if (!m.tick) m.tick = ctx.setInterval(() => tick(ctx), 1000)
+    ctx.log('recording resumed')
+    ctx.render()
+    return true
+  } finally { m.resuming = false }
 }
 
 /**
@@ -354,8 +400,16 @@ function hint(ctx, text) {
 /** @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx */
 function tick(ctx) {
   const m = ctx.mem
-  if (m.screen !== 'live') return
+  if (!['live', 'confirm', 'insight', 'insights'].includes(m.screen)) return
   const now = Date.now()
+  // No mic frames for a while: the phone is gone, not the room quiet. Say so
+  // on the glasses and try to pick the recording back up.
+  if ((m.lastAudioAt && now - m.lastAudioAt > AUDIO_GAP_MS) || !m.stream?.open) {
+    if (m.micOn) { m.micOn = false; m.status = 'paused — tap to resume'; ctx.render() }
+    if (ctx.connected && !m.resuming && now - (m.resumeAt || 0) > RESUME_EVERY_MS) { m.resumeAt = now; void resume(ctx) }
+    return
+  }
+  if (m.screen !== 'live') return
   if (m.cue && now - m.cue.shownAt > CUE_TTL_MS) { m.cue = null; ctx.render() }
   if (!ctx.state.cues || m.cueBusy || now - m.lastCueAt < CUE_EVERY_MS) return
   const total = words(transcript(m))
@@ -513,6 +567,7 @@ export default {
     m.lastCueAt = 0; m.lastCueWords = 0; m.review = null; m.page = 0; m.sessions = []; m.summarizing = false
     m.notesIndexedAt = 0; m.noteFolder = ''; m.noteList = []; m.noteWindow = 0; m.note = null; m.brainMapRunning ??= false
     m.audioOut = null; m.audioPath = ''; m.audioBytes = 0; m.hintT = null
+    m.micOn ??= false; m.lastAudioAt ??= 0; m.resuming = false; m.resumeAt ??= 0
     m.insights ??= []; m.insightAt = 0; m.level = 0; m.repassing = false
     setTimeout(() => indexNotes(ctx, true), 500)
   },
@@ -556,7 +611,7 @@ export default {
         const bars = '▌'.repeat(Math.max(1, Math.min(3, 1 + Math.round(m.level * 2))))
         const time = new Date().toLocaleTimeString(ctx.locale, { hour: 'numeric', minute: '2-digit', timeZone: ctx.tz })
         top.push({ type: 'text', name: 'clock', x: W - CLOCK_W, y: 0, w: CLOCK_W, h: BOX_LINE, padding: PAD, textColor: 3,
-          text: ctx.ui.align(`${m.audioOut ? '●' : '○'} ${bars}  ${time}`, CLOCK_W - 2 * PAD - 8, 'right') })
+          text: ctx.ui.align(m.micOn ? `● ${bars}  ${time}` : `paused  ${time}`, CLOCK_W - 2 * PAD - 8, 'right') })
       }
 
       return {
@@ -650,6 +705,7 @@ export default {
       case 'live':
         // tap opens the badge (or the list); double-tap always asks to stop
         if (ev.type === 'tap') {
+          if (!m.micOn || !m.stream?.open) { void resume(ctx); return true }   // paused: pick the mic back up
           if (m.cue) { m.insightAt = Math.max(0, m.insights.lastIndexOf(m.cue)); m.screen = 'insight'; ctx.render() }
           else if (m.insights.length) { m.screen = 'insights'; ctx.render() }
           else hint(ctx, 'double-tap to stop · insights appear here')
@@ -681,10 +737,10 @@ export default {
         if (ev.type === 'select') {
           if (ev.index === 1) void stop(ctx)
           else if (ev.index === 2) void stop(ctx, false)
-          else { m.screen = 'live'; ctx.render() }
+          else { m.screen = 'live'; ctx.render(); if (!m.micOn || !m.stream?.open) void resume(ctx) }   // "keep recording" really resumes
           return true
         }
-        if (ev.type === 'double' || ev.type === 'tap') { m.screen = 'live'; ctx.render(); return true }
+        if (ev.type === 'double' || ev.type === 'tap') { m.screen = 'live'; ctx.render(); if (!m.micOn || !m.stream?.open) void resume(ctx); return true }
         return
       case 'review':
         if (ev.type === 'tap') { m.page++; ctx.render(); return true }
@@ -743,6 +799,8 @@ export default {
 
   onAudio(ctx, pcm) {
     const m = ctx.mem
+    m.lastAudioAt = Date.now()
+    if (!m.micOn) { m.micOn = true; m.status = 'listening' }
     m.stream?.send(pcm)
     if (m.audioOut) { m.audioBytes += pcm.length; m.audioOut.write(Buffer.from(pcm)) }
     const buf = Buffer.from(pcm)
