@@ -32,7 +32,7 @@ import { Store } from './store.js'
  *   finals: { t: number, speaker: number | null, text: string }[], interim: string, startedAt: number, error: string, status: string,
  *   cue: Cue | null, cueBusy: boolean, lastCueAt: number, lastCueWords: number, tick: any, keepTick: any,
  *   audioOut: import('node:fs').WriteStream | null, audioPath: string, audioBytes: number, hintT: any,
- *   micOn: boolean, lastAudioAt: number, resuming: boolean, resumeAt: number,
+ *   micOn: boolean, lastAudioAt: number, resuming: boolean, resumeAt: number, checkpointAt: number,
  *   insights: Cue[], insightAt: number, level: number, repassing: boolean,
  *   review: import('./store.js').Session | null, page: number, sessions: import('./store.js').Session[], summarizing: boolean, cueHistory?: string[] }} Mem */
 
@@ -40,6 +40,10 @@ const W = 576, H = 288, HEADER = 36, PAD = 4, LINE = 27
 const CUE_EVERY_MS = 12_000, CUE_MIN_WORDS = 12, CUE_TTL_MS = 45_000
 /** the mic feeds us every ~100 ms: a longer gap means the phone went away */
 const AUDIO_GAP_MS = 6000, RESUME_EVERY_MS = 15_000
+/** a session that has heard nothing for this long is wrapped up by itself */
+const PAUSE_END_MS = 5 * 60_000
+/** the transcript so far is written to the database this often, so a crash keeps it */
+const CHECKPOINT_MS = 30_000
 // Conversate-style layout: the insight badge sits top left, the clock and the
 // recording meter top right, the live captions on the last few lines.
 // a bordered box needs room for the border too, or the firmware shows a scrollbar
@@ -171,9 +175,19 @@ async function finishRecording(ctx, keep) {
   m.audioOut = null; m.audioPath = ''
   if (!out || !pcm) return { file: '', secs: 0 }
   await new Promise((res) => out.end(res))
+  if (!keep) { try { unlinkSync(pcm) } catch {} ; return { file: '', secs: 0 } }
+  return encodeRecording(ctx, pcm)
+}
+/**
+ * Raw PCM on disk → something playable. Used when a session ends and when one
+ * is recovered after a crash, so audio is never stranded.
+ * @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx @param {string} pcm
+ * @returns {Promise<{ file: string, secs: number }>}
+ */
+async function encodeRecording(ctx, pcm) {
   const bytes = existsSync(pcm) ? statSync(pcm).size : 0
   const secs = bytes / (RATE * BYTES_PER_SAMPLE)
-  if (!keep || bytes < RATE) { try { unlinkSync(pcm) } catch {} ; return { file: '', secs: 0 } }
+  if (bytes < RATE) { try { unlinkSync(pcm) } catch {} ; return { file: '', secs: 0 } }
   const wav = pcm.replace(/\.pcm$/, '.wav')
   try { await pcmToWav(pcm, wav, bytes) } catch (err) { ctx.log(`recording: ${err instanceof Error ? err.message : err}`); return { file: '', secs } }
   try { unlinkSync(pcm) } catch {}
@@ -181,6 +195,34 @@ async function finishRecording(ctx, keep) {
   const ok = await run('lame', ['--quiet', '-m', 'm', '-b', '48', wav, mp3]) || await run('ffmpeg', ['-y', '-loglevel', 'error', '-i', wav, '-c:a', 'libmp3lame', '-b:a', '48k', mp3])
   if (ok && existsSync(mp3)) { try { unlinkSync(wav) } catch {} ; return { file: basename(mp3), secs } }
   return { file: basename(wav), secs }
+}
+
+/**
+ * A session with no ending means something died mid-recording (the server
+ * restarted, the app was reloaded, the process was killed). The audio is still
+ * on disk: encode it, transcribe it properly and write the summary, so nothing
+ * is lost but the live captions.
+ * @param {import('../../../shared/app.ts').AppContext<State, Mem>} ctx
+ */
+async function recoverUnfinished(ctx) {
+  const s = store(ctx)
+  for (const sess of s.unfinished()) {
+    if (sess.id === ctx.mem.sessionId) continue        // this one is live right now
+    if (Date.now() - sess.started < 10_000) continue   // just created by someone else
+    try {
+      const pcm = join(audioDir(ctx), `session-${sess.id}.pcm`)
+      const rec = existsSync(pcm) ? await encodeRecording(ctx, pcm) : { file: sess.audio || '', secs: sess.audioSecs || 0 }
+      s.update(sess.id, { ended: sess.started + Math.round(rec.secs * 1000), audio: rec.file, audioSecs: Math.round(rec.secs) })
+      ctx.log(`recovering session ${sess.id} (${Math.round(rec.secs)} s of audio)`)
+      if (rec.file) await rePass(ctx, sess.id)
+      else {
+        const text = sess.transcript || ''
+        if (words(text) >= 5) { await summarize(ctx, sess.id, text, sess.prep); s.finish(sess.id) }
+        else { s.update(sess.id, { title: 'Interrupted (no audio)' }); s.finish(sess.id) }
+      }
+      ctx.log(`recovered session ${sess.id}`)
+    } catch (err) { ctx.log(`recovering session ${sess.id}: ${err instanceof Error ? err.message : err}`) }
+  }
 }
 /** Content type from the extension. @param {string} f */
 const audioType = (f) => f.endsWith('.mp3') ? 'audio/mpeg' : f.endsWith('.m4a') ? 'audio/mp4' : f.endsWith('.ogg') ? 'audio/ogg' : 'audio/wav'
@@ -248,7 +290,10 @@ async function stop(ctx, keep = true) {
   s.finish(id)
   m.summarizing = false
   if (m.sessionId === id) { m.review = s.get(id); m.page = 0; ctx.render() }
-  if (ctx.state.repass !== false && rec.file) void rePass(ctx, id)
+  // A sparse transcript for a long recording means the live stream was cut off:
+  // re-transcribe from the audio even if the second pass is switched off.
+  const sparse = rec.secs > 60 && words(text) < rec.secs / 3
+  if (rec.file && (ctx.state.repass !== false || sparse)) { if (sparse) ctx.log(`transcript looks thin (${words(text)} words for ${Math.round(rec.secs)} s) — re-transcribing`); void rePass(ctx, id) }
 }
 
 /**
@@ -406,8 +451,21 @@ function tick(ctx) {
   // on the glasses and try to pick the recording back up.
   if ((m.lastAudioAt && now - m.lastAudioAt > AUDIO_GAP_MS) || !m.stream?.open) {
     if (m.micOn) { m.micOn = false; m.status = 'paused — tap to resume'; ctx.render() }
+    // Nothing heard for a long while: wrap it up rather than pretend to record.
+    if (m.lastAudioAt && now - m.lastAudioAt > PAUSE_END_MS) {
+      ctx.log(`no audio for ${Math.round((now - m.lastAudioAt) / 1000)} s — ending the session`)
+      ctx.notify('Recording ended: the glasses stopped sending audio', { ms: 4000 })
+      void stop(ctx)
+      return
+    }
     if (ctx.connected && !m.resuming && now - (m.resumeAt || 0) > RESUME_EVERY_MS) { m.resumeAt = now; void resume(ctx) }
     return
+  }
+  // Keep the database in step with what we have heard: if everything dies now,
+  // the words are still there and the audio can be re-transcribed.
+  if (now - (m.checkpointAt || 0) > CHECKPOINT_MS) {
+    m.checkpointAt = now
+    try { store(ctx).update(m.sessionId, { transcript: transcript(m) }) } catch {}
   }
   if (m.screen !== 'live') return
   if (m.cue && now - m.cue.shownAt > CUE_TTL_MS) { m.cue = null; ctx.render() }
@@ -567,7 +625,8 @@ export default {
     m.lastCueAt = 0; m.lastCueWords = 0; m.review = null; m.page = 0; m.sessions = []; m.summarizing = false
     m.notesIndexedAt = 0; m.noteFolder = ''; m.noteList = []; m.noteWindow = 0; m.note = null; m.brainMapRunning ??= false
     m.audioOut = null; m.audioPath = ''; m.audioBytes = 0; m.hintT = null
-    m.micOn ??= false; m.lastAudioAt ??= 0; m.resuming = false; m.resumeAt ??= 0
+    m.micOn ??= false; m.lastAudioAt ??= 0; m.resuming = false; m.resumeAt ??= 0; m.checkpointAt = 0
+    setTimeout(() => { void recoverUnfinished(ctx) }, 4000)   // pick up anything a crash left behind
     m.insights ??= []; m.insightAt = 0; m.level = 0; m.repassing = false
     setTimeout(() => indexNotes(ctx, true), 500)
   },
@@ -697,6 +756,8 @@ export default {
 
   onEvent(ctx, ev) {
     const m = ctx.mem
+    // The glasses page came back after being ejected: pick the recording up now.
+    if (ev.type === 'enter' && ['live', 'confirm', 'insight', 'insights'].includes(m.screen) && (!m.micOn || !m.stream?.open)) void resume(ctx)
     if (m.error && m.screen !== 'live') { if (ev.type === 'tap' || ev.type === 'double') { m.error = ''; m.screen = 'idle'; ctx.render(); return true } return }
     switch (m.screen) {
       case 'idle':

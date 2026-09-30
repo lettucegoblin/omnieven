@@ -98,6 +98,8 @@ export class Store {
   get(id) { const r = this.db.prepare('SELECT * FROM sessions WHERE id = ?').get(id); return r ? Store.row(r) : null }
   /** @param {number} [limit] @returns {Session[]} */
   list(limit = 20) { return this.db.prepare('SELECT * FROM sessions WHERE ended IS NOT NULL ORDER BY started DESC LIMIT ?').all(limit).map(Store.row) }
+  /** Sessions that never got an ending — the server or the phone died mid-recording. */
+  unfinished() { return this.db.prepare('SELECT * FROM sessions WHERE ended IS NULL ORDER BY started').all().map(Store.row) }
   /**
    * Recall: sessions whose text matches any of the terms, with a snippet.
    * @param {string[]} terms @param {number} [exclude] @returns {{ id: number, title: string, started: number, snippet: string }[]}

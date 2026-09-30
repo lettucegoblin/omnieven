@@ -220,16 +220,34 @@ function splash(status: string) {
  * Put a page on the glasses (create it the first time, rebuild after that).
  * Used by the server's `page` command and by the offline shell.
  */
+/**
+ * A page the glasses refuse to build several times running means the WebView's
+ * bridge is wedged (it happens when the Even App ejects the page). Reloading
+ * re-initialises it; without this the app looks alive but draws nothing.
+ */
+let pageFailures = 0
+let lastReload = 0
+const PAGE_FAILURES_BEFORE_RELOAD = 6, RELOAD_COOLDOWN_MS = 120_000
+function pageFailed(err: unknown) {
+  pageFailures++
+  if (pageFailures < PAGE_FAILURES_BEFORE_RELOAD || Date.now() - lastReload < RELOAD_COOLDOWN_MS) return
+  lastReload = Date.now()
+  log(`page build failed ${pageFailures}× (${err}) — reloading the page`, 'warn')
+  setTimeout(() => window.location.reload(), 300)
+}
 async function drawPage(page: PagePayload): Promise<void> {
   if (!bridge) return
-  if (!pageCreated) {
-    const r = await withTimeout(bridge.createStartUpPageContainer(page as any), 'createStartUpPageContainer')
-    pageCreated = r === 0
-    if (r !== 0) throw new Error(`create result ${r}`)
-  } else {
-    const ok = await withTimeout(bridge.rebuildPageContainer(page as any), 'rebuildPageContainer')
-    if (!ok) throw new Error('rebuild returned false')
-  }
+  try {
+    if (!pageCreated) {
+      const r = await withTimeout(bridge.createStartUpPageContainer(page as any), 'createStartUpPageContainer')
+      pageCreated = r === 0
+      if (r !== 0) throw new Error(`create result ${r}`)
+    } else {
+      const ok = await withTimeout(bridge.rebuildPageContainer(page as any), 'rebuildPageContainer')
+      if (!ok) throw new Error('rebuild returned false')
+    }
+  } catch (err) { pageFailed(err); throw err }
+  pageFailures = 0
 }
 /** Pages kept for when the server can't be reached; it knows nothing about the apps. */
 const offline = new OfflineShell((page) => exclusive(() => drawPage(page)), (msg) => log(msg))

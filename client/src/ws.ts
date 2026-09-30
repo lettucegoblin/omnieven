@@ -70,7 +70,9 @@ export class OmniSocket {
 
   private scheduleReconnect() {
     if (this.closedByUser) return
-    const delay = Math.min(30000, 500 * 2 ** Math.min(this.attempts++, 6))
+    // Fast at first, and never more than a few seconds apart: a dropped socket
+    // during a live app (a recording, say) must not sit idle for half a minute.
+    const delay = Math.min(8000, 400 * 2 ** Math.min(this.attempts++, 5))
     this.timer = window.setTimeout(() => this.open(), delay)
   }
 }
