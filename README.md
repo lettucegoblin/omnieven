@@ -177,6 +177,22 @@ scripts/   fake-client.mjs (headless glasses)  dev-server.sh    docs/   APPS.md 
 
 `npm run typecheck` checks server, shared, demo apps and client against the same types.
 
+## Keeping it up
+
+A server-side app can block Node's event loop (a runaway loop, a pathological
+layout): the process keeps its port but answers nothing, and the glasses sit
+there. `scripts/omni-watchdog.sh` probes `/api/status` and restarts the service
+after two failures in a row — run it from a systemd timer every minute:
+
+```ini
+# ~/.config/systemd/user/omni-watchdog.service     Type=oneshot, ExecStart=…/scripts/omni-watchdog.sh
+# ~/.config/systemd/user/omni-watchdog.timer       OnUnitActiveSec=1min
+systemctl --user enable --now omni-watchdog.timer
+```
+
+The server also logs `event loop was blocked for N s` once it recovers, which is
+the breadcrumb for finding what did it.
+
 ## Platform notes
 
 - Canvas 576×288, 4-bit green. ≤12 containers (≤8 text/list, ≤4 image), exactly one

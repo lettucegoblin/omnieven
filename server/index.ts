@@ -154,6 +154,17 @@ wss.on('connection', (ws, req) => {
   ws.on('error', (err: Error) => log('warn', `ws ${conn.id}: ${err.message}`))
 })
 
+// A blocked event loop (a runaway app, a pathological layout) can't log while
+// it happens, but it can own up afterwards — and the watchdog restarts us if it
+// never comes back. See scripts/omni-watchdog.sh.
+const LOOP_TICK_MS = 1000, LOOP_STALL_MS = 5000
+let lastTick = Date.now()
+setInterval(() => {
+  const late = Date.now() - lastTick - LOOP_TICK_MS
+  if (late > LOOP_STALL_MS) log('warn', `event loop was blocked for ${(late / 1000).toFixed(1)} s`)
+  lastTick = Date.now()
+}, LOOP_TICK_MS).unref()
+
 // ── boot ─────────────────────────────────────────────────────────────
 await shell.start()
 server.listen(PORT, HOST, () => {

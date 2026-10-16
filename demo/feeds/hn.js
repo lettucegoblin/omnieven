@@ -8,6 +8,7 @@ const API = 'https://hacker-news.firebaseio.com/v0'
 const REFRESH_MS = 5 * 60 * 1000
 const STORIES = 20
 const COMMENTS = 12
+const MAX_ARTICLE_CHARS = 120_000   // a readable article; anything bigger is a dump
 const PAGE_LINES = 8          // 36 px header + 8 × 27 px lines fits 288 px
 
 /** @typedef {{ id: number, title: string, score: number, by: string, url?: string, text?: string, descendants?: number, kids?: number[] }} Story */
@@ -49,6 +50,9 @@ function articleText(html) {
     // Menus and separators ("· Posts · Videos ·") are mostly punctuation.
     const letters = (t.match(/[\p{L}\p{N}]/gu) || []).length
     if (letters / t.length < 0.6) return
+    // Minified script, base64 or a hash: not prose, and a huge unbroken token
+    // is expensive for every layout step downstream.
+    if (/\S{120}/.test(t)) return
     const line = isHead ? t.toUpperCase() : t
     all.push(line)
     if (inScope > 0) scoped.push(line)
@@ -75,7 +79,7 @@ function articleText(html) {
   }
   flush()
   const pick = scoped.join('\n\n').length > 200 ? scoped : all
-  return pick.join('\n\n')
+  return pick.join('\n\n').slice(0, MAX_ARTICLE_CHARS)
 }
 
 /** @param {string} url */

@@ -12,28 +12,58 @@ export { getTextWidth, pxTruncate }
 /** Pixel width → how many text lines fit in `heightPx`. */
 export function linesFor(heightPx: number, padding = 0): number { return Math.max(1, Math.floor((heightPx - 2 * padding) / LINE)) }
 
+/** No glyph is narrower than this, so a line can never hold more characters than width/this. */
+const MIN_ADVANCE_PX = 4
+/** Hard ceilings: text this long is a bug upstream, and wrapping it would block the server. */
+const MAX_WRAP_CHARS = 200_000, MAX_WRAP_LINES = 20_000
+
+/**
+ * How many characters of `s` fit in `widthPx` — at least one, so wrapping
+ * always makes progress. Binary search over a bounded range (a line can hold
+ * at most width/MIN_ADVANCE_PX characters), which keeps this cheap no matter
+ * how long the string is: a linear scan here once cost the server three days
+ * in a 100% CPU loop on an article with a huge unbroken token.
+ */
+function fitChars(s: string, widthPx: number): number {
+  const cap = Math.max(1, Math.min(s.length, Math.ceil(Math.max(widthPx, MIN_ADVANCE_PX) / MIN_ADVANCE_PX) + 2))
+  if (getTextWidth(s.slice(0, cap)) <= widthPx) return cap
+  let lo = 1, hi = cap
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1
+    if (getTextWidth(s.slice(0, mid)) <= widthPx) lo = mid
+    else hi = mid - 1
+  }
+  return Math.max(1, lo)
+}
+
 /** Wrap `text` to `widthPx` and return the resulting lines (firmware rules). */
 export function wrap(text: string, widthPx: number): string[] {
+  const width = Number.isFinite(widthPx) && widthPx > MIN_ADVANCE_PX ? widthPx : MIN_ADVANCE_PX
+  const cap = Math.max(1, Math.ceil(width / MIN_ADVANCE_PX) + 2)   // no line can hold more than this
   const out: string[] = []
-  for (const para of String(text ?? '').split('\n')) {
+  /** Emit full lines of a chunk that is too wide to fit, and return the rest. */
+  const breakUp = (chunk: string): string => {
+    let pos = 0
+    while (chunk.length - pos > 1) {
+      if (chunk.length - pos <= cap && getTextWidth(chunk.slice(pos)) <= width) break
+      const cut = fitChars(chunk.slice(pos, pos + cap), width)
+      out.push(chunk.slice(pos, pos + cut))
+      pos += cut
+      if (out.length > MAX_WRAP_LINES) break
+    }
+    return chunk.slice(pos)
+  }
+  const src = String(text ?? '')
+  for (const para of (src.length > MAX_WRAP_CHARS ? src.slice(0, MAX_WRAP_CHARS) : src).split('\n')) {
+    if (out.length > MAX_WRAP_LINES) break
     if (!para) { out.push(''); continue }
-    const words = para.split(/(\s+)/)
     let line = ''
-    for (const w of words) {
+    for (const w of para.split(/(\s+)/)) {
       const cand = line + w
-      if (getTextWidth(cand) <= widthPx || !line) {
-        line = cand
-        // A single word wider than the box: hard-break it.
-        while (getTextWidth(line) > widthPx && line.length > 1) {
-          let cut = line.length - 1
-          while (cut > 1 && getTextWidth(line.slice(0, cut)) > widthPx) cut--
-          out.push(line.slice(0, cut))
-          line = line.slice(cut)
-        }
-      } else {
-        out.push(line.trimEnd())
-        line = w.trimStart()
-      }
+      if (getTextWidth(cand) <= width) line = cand
+      else if (!line) line = breakUp(cand)                                  // one word, wider than the box
+      else { out.push(line.trimEnd()); line = breakUp(w.trimStart()) }
+      if (out.length > MAX_WRAP_LINES) break
     }
     out.push(line.trimEnd())
   }
@@ -43,8 +73,9 @@ export function wrap(text: string, widthPx: number): string[] {
 /** Split long text into screen-sized pages of wrapped lines. */
 export function paginate(text: string, { widthPx = SCREEN.width - 8, lines = linesFor(SCREEN.height, 4) } = {}): string[] {
   const all = wrap(text, widthPx)
+  const step = Math.max(1, Math.floor(lines) || 1)   // a zero would never advance
   const pages: string[] = []
-  for (let i = 0; i < all.length; i += lines) pages.push(all.slice(i, i + lines).join('\n'))
+  for (let i = 0; i < all.length; i += step) pages.push(all.slice(i, i + step).join('\n'))
   return pages.length ? pages : ['']
 }
 
